@@ -1,0 +1,28 @@
+[project]
+name = "taxelnet"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+    { name = "vctr-dng", email = "94930828+vctr-dng@users.noreply.github.com" },
+    { name = "BerithCS", email = "berithcruzs@gmail.com"}
+]
+requires-python = ">=3.13"
+dependencies = [
+    "marimo>=0.25.1",
+    "numpy>=2.5.3",
+    "torch>=2.14.1",
+    "torchvision>=0.29.1",
+    "tqdm>=4.70.1",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.22,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
