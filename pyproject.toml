@@ -24,6 +24,7 @@ project-includes = [
     "**/*.py*",
     "**/*.ipynb",
 ]
+search-path = ["src", "tests"]
 
 [build-system]
 requires = ["uv_build>=0.12.22,<0.13.0"]
