@@ -12,10 +12,17 @@ authors = [
 requires-python = ">=3.13"
 dependencies = [
     "marimo>=0.25.1",
+    "mlflow>=3.16.1",
     "numpy>=2.5.3",
     "torch>=2.14.1",
     "torchvision>=0.29.1",
     "tqdm>=4.70.1",
+]
+
+[tool.pyrefly]
+project-includes = [
+    "**/*.py*",
+    "**/*.ipynb",
 ]
 
 [build-system]
