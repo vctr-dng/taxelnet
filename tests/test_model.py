@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import torch
 
-from taxelnet.model import CNNTaxelPredictor
+from taxelnet.config import ModelConfig
+from taxelnet.model import CNNTaxelPredictor, build_model
 
 
 def test_cnn_taxel_predictor_output_shape_matches_taxel_grid():
@@ -39,3 +40,11 @@ def test_cnn_taxel_predictor_single_sample_batch():
     out = model(x)
 
     assert out.shape == (1, *taxel_shape)
+
+
+def test_cnn_taxel_predictor_on_indenter_grids():
+    model = build_model(ModelConfig(), (7, 4))
+    out = model(torch.randn(2, 1, 77, 49))
+
+    assert out.shape == (2, 7, 4)
+    assert torch.isfinite(out).all()

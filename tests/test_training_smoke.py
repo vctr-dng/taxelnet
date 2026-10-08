@@ -1,75 +1,139 @@
-"""End-to-end smoke tests for taxelnet.training.fit and taxelnet.evaluation.
+"""End-to-end smoke test: two epochs of group-balanced training with local MLflow tracking.
 
-These exercise the reusable library loop directly (not through any scripts/
-entrypoint, which doesn't exist yet) on small synthetic in-memory data, so
-they stay fast and don't depend on real experimental data.
+Runs the library orchestration (`run_training`, what scripts/train.py calls) on a small
+synthetic matched pair, so it stays fast and doesn't depend on real experimental data.
 """
 
 from __future__ import annotations
 
+import json
 import math
 
+import mlflow
 import numpy as np
-from torch.utils.data import DataLoader
+import polars as pl
+import pytest
+import torch
 
-from taxelnet.config import TrainConfig
-from taxelnet.dataset import JoinedSample, TaxelDataset, random_split_dataset
-from taxelnet.evaluation import evaluate_test_set
-from taxelnet.model import CNNTaxelPredictor
-from taxelnet.training import fit
+from taxelnet.checkpoint import load_checkpoint, load_model
+from taxelnet.config import Configs, parse_configs
+from taxelnet.dataset import TaxelDataset, load_paired
+from taxelnet.evaluation import predict
+from taxelnet.model import build_model
+from taxelnet.preprocessing import Preprocessor
+from taxelnet.training import group_balanced_l1, run_training
 
-MESH_SHAPE = (6, 6)
-TAXEL_SHAPE = (2, 2)
+BUNDLE = [
+    "model.pt",
+    "best.pt",
+    "last.pt",
+    "preprocessing.json",
+    "node_ids.csv",
+    "schema_report.json",
+    "split_manifest.json",
+    "metrics.json",
+    "predictions_test.parquet",
+    "requirements.lock.txt",
+    "config.json",
+    "checkpoints/epoch_0002.pt",
+    "checkpoints/epoch_0003.pt",
+    "plots/epoch_0002/samples.png",
+    "plots/epoch_0002/scatter.png",
+    "plots/epoch_0002/per_taxel_mae.png",
+    "plots/epoch_0003/test_metrics.json",
+    "plots/best/samples.png",
+]
 
 
-def _make_synthetic_samples(n: int, seed: int) -> list[JoinedSample]:
-    rng = np.random.default_rng(seed)
-    return [
-        JoinedSample(
-            object_name=f"obj_{i}",
-            force=float(i),
-            mesh=rng.standard_normal(MESH_SHAPE).astype(np.float32),
-            taxel=rng.standard_normal(TAXEL_SHAPE).astype(np.float32),
-        )
-        for i in range(n)
-    ]
+def test_group_balanced_l1_averages_groups_equally():
+    pred = torch.tensor([[1.0], [1.0], [1.0], [5.0]])
+    target = torch.zeros(4, 1)
+    group = torch.tensor([7, 7, 7, 2])
 
-
-def test_fit_runs_two_epochs_and_checkpoints(tmp_path):
-    dataset = TaxelDataset(_make_synthetic_samples(12, seed=0))
-    train_subset, val_subset = random_split_dataset(dataset, val_ratio=0.25, seed=0)
-    train_loader = DataLoader(train_subset, batch_size=4, shuffle=True)
-    val_loader = DataLoader(val_subset, batch_size=4)
-
-    model = CNNTaxelPredictor(taxel_shape=TAXEL_SHAPE)
-    train_cfg = TrainConfig(
-        epochs=2,
-        batch_size=4,
-        lr=1e-3,
-        device="cpu",
-        checkpoint_dir=tmp_path / "checkpoints",
-        log_dir=tmp_path / "runs",
-        seed=0,
+    assert group_balanced_l1(pred, target, group).item() == pytest.approx(3.0)
+    assert group_balanced_l1(pred, target, group, alpha=1.0).item() == pytest.approx(
+        2.0
     )
 
-    history = fit(model, train_loader, val_loader, train_cfg)
 
-    assert len(history.train_losses) == 2
-    assert len(history.val_losses) == 2
-    assert all(math.isfinite(loss) for loss in history.train_losses)
-    assert all(math.isfinite(loss) for loss in history.val_losses)
-    assert (train_cfg.checkpoint_dir / "last.pt").exists()
-    assert (train_cfg.checkpoint_dir / "best.pt").exists()
+def test_parse_configs_overrides():
+    cfgs = parse_configs(
+        [
+            "--train.epochs",
+            "2",
+            "--data.cache_dir",
+            "none",
+            "--preprocessing.clip_input=-1,3",
+        ]
+    )
+    assert cfgs.train.epochs == 2
+    assert cfgs.data.cache_dir is None
+    assert cfgs.preprocessing.clip_input == (-1.0, 3.0)
+    assert Configs().train.epochs != 2
 
 
-def test_evaluate_test_set_returns_finite_metrics(tmp_path):
-    test_dataset = TaxelDataset(_make_synthetic_samples(5, seed=1))
-    test_loader = DataLoader(test_dataset, batch_size=4)
+def test_run_training_two_epochs(tmp_path, synthetic_pair):
+    real_csv, sim_csv = synthetic_pair
+    cfgs = Configs()
+    cfgs.data.data_dir = tmp_path
+    cfgs.data.real_csv, cfgs.data.sim_csv = real_csv.name, sim_csv.name
+    cfgs.data.cache_dir = tmp_path / "cache"
+    cfgs.data.test_manifest = tmp_path / "test_manifest.json"
+    cfgs.train.epochs = 3
+    cfgs.train.test_every = 2  # epoch 2, plus the last epoch
+    cfgs.train.groups_per_batch = 8
+    cfgs.train.device = "cpu"
+    cfgs.train.output_dir = tmp_path / "outputs"
+    cfgs.tracking.uri = f"sqlite:///{tmp_path / 'mlflow.db'}"
+    cfgs.tracking.artifact_location = (tmp_path / "mlartifacts").as_uri()
 
-    model = CNNTaxelPredictor(taxel_shape=TAXEL_SHAPE)
+    result = run_training(cfgs)
 
-    metrics = evaluate_test_set(model, test_loader, device="cpu")
+    for name in BUNDLE:
+        assert (result.run_dir / name).exists(), name
+    metrics = json.loads((result.run_dir / "metrics.json").read_text())
+    assert math.isfinite(metrics["test"]["micro_mae"])
+    assert math.isfinite(metrics["test"]["macro_mae"])
+    assert metrics["integrity"]["scalers_fitted_on"] == "train"
 
-    assert "mse" in metrics
-    assert math.isfinite(metrics["mse"])
-    assert metrics["mse"] >= 0
+    preds = pl.read_parquet(result.run_dir / "predictions_test.parquet")
+    assert preds.height == metrics["test"]["n_readings"]
+    assert set(preds["partition"]) == {"test"}
+
+    client = mlflow.MlflowClient(cfgs.tracking.uri)
+    run = client.get_run(result.run_id)
+    assert {"train_loss", "val_macro_mae", "final_test_macro_mae"} <= set(
+        run.data.metrics
+    )
+    assert len(client.get_metric_history(result.run_id, "val_micro_mae")) == 3
+    test_history = client.get_metric_history(result.run_id, "test_micro_mae")
+    assert sorted(m.step for m in test_history) == [2, 3]
+    assert not (result.run_dir / "checkpoints" / "epoch_0001.pt").exists()
+    assert run.data.params["train.epochs"] == "3"
+    assert "sha256." + real_csv.name in run.data.tags
+    artifacts = {a.path for a in client.list_artifacts(result.run_id)}
+    assert {"best.pt", "metrics.json", "split_manifest.json", "plots"} <= artifacts
+    assert {a.path for a in client.list_artifacts(result.run_id, "plots")} == {
+        "plots/epoch_0002",
+        "plots/epoch_0003",
+        "plots/best",
+    }
+    assert {a.path for a in client.list_artifacts(result.run_id, "checkpoints")} == {
+        "checkpoints/epoch_0002.pt",
+        "checkpoints/epoch_0003.pt",
+    }
+
+    # bundle round trip: best.pt and model.pt reproduce the evaluated predictions
+    pre = Preprocessor.load(result.run_dir / "preprocessing.json")
+    paired = load_paired(cfgs.data)
+    test_rows = np.sort(preds["source_row"].to_numpy())
+    ds = TaxelDataset(paired, test_rows, pre.transform_x, pre.transform_y)
+    model = build_model(cfgs.model, paired.taxel_shape)
+    ckpt = load_checkpoint(result.run_dir / "best.pt", model)
+    assert ckpt["mlflow_run_id"] == result.run_id
+    assert ckpt["epoch"] == metrics["best_epoch"]
+    expected = np.array(preds.sort("source_row")["prediction"].to_list())
+    expected = expected.reshape(-1, 7, 4)
+    np.testing.assert_allclose(predict(model, ds, pre), expected, rtol=1e-5, atol=1e-3)
+    loaded = load_model(result.run_dir / "model.pt")
+    np.testing.assert_allclose(predict(loaded, ds, pre), expected, rtol=1e-5, atol=1e-3)

@@ -1,132 +1,85 @@
-"""Tests for taxelnet.dataset: (object_name, force) join + torch Dataset."""
+"""Tests for taxelnet.dataset: strict row pairing, TaxelDataset, GroupBatchSampler."""
 
 from __future__ import annotations
 
 import numpy as np
 import pytest
 import torch
-from _helpers import (
-    MESH_GRID_SHAPE,
-    SAMPLE_KEYS,
-    TAXEL_GRID_SHAPE,
-    expected_grid_array,
-    mesh_value,
-    taxel_value,
-)
+from _helpers import ROWS, write_pair
 
-from taxelnet.dataset import (
-    JoinedSample,
-    TaxelDataset,
-    join_tables,
-    random_split_dataset,
-)
-from taxelnet.io_csv import read_grid_csv
+from taxelnet.config import DataConfig
+from taxelnet.dataset import GroupBatchSampler, TaxelDataset, load_paired
 
 
-def test_join_tables_matches_on_object_name_and_force(tiny_mesh_csv, tiny_taxel_csv):
-    mesh = read_grid_csv(tiny_mesh_csv)
-    taxel = read_grid_csv(tiny_taxel_csv)
-
-    samples = join_tables(mesh, taxel, strict=True)
-
-    assert len(samples) == len(SAMPLE_KEYS)
-    expected_mesh = expected_grid_array(SAMPLE_KEYS, MESH_GRID_SHAPE, mesh_value)
-    expected_taxel = expected_grid_array(SAMPLE_KEYS, TAXEL_GRID_SHAPE, taxel_value)
-    for i, (object_name, force) in enumerate(SAMPLE_KEYS):
-        sample = samples[i]
-        assert sample.object_name == object_name
-        assert sample.force == pytest.approx(float(force))
-        np.testing.assert_allclose(sample.mesh, expected_mesh[i])
-        np.testing.assert_allclose(sample.taxel, expected_taxel[i])
+def _cfg(real_csv, sim_csv) -> DataConfig:
+    return DataConfig(
+        data_dir=real_csv.parent,
+        real_csv=real_csv.name,
+        sim_csv=sim_csv.name,
+        cache_dir=None,
+    )
 
 
-def test_join_tables_strict_raises_on_mismatched_keys(
-    tiny_mesh_csv, mismatched_taxel_csv
-):
-    mesh = read_grid_csv(tiny_mesh_csv)
-    taxel = read_grid_csv(mismatched_taxel_csv)
+def test_repeated_key_is_one_group_with_own_sim_rows(pair):
+    paired = load_paired(_cfg(*pair))
 
-    with pytest.raises(ValueError):
-        join_tables(mesh, taxel, strict=True)
-
-
-def test_join_tables_non_strict_drops_unmatched_keys(
-    tiny_mesh_csv, mismatched_taxel_csv
-):
-    mesh = read_grid_csv(tiny_mesh_csv)
-    taxel = read_grid_csv(mismatched_taxel_csv)
-
-    samples = join_tables(mesh, taxel, strict=False)
-
-    # mesh keys: obj_a/1.0, obj_a/2.0, obj_b/1.0, obj_b/2.0
-    # taxel keys: obj_a/1.0, obj_a/2.0, obj_b/1.0, obj_c/1.0
-    # intersection: obj_a/1.0, obj_a/2.0, obj_b/1.0
-    got_keys = {(s.object_name, s.force) for s in samples}
-    assert got_keys == {("obj_a", 1.0), ("obj_a", 2.0), ("obj_b", 1.0)}
+    assert paired.x.shape == (len(ROWS), 77, 49)
+    assert paired.y.shape == (len(ROWS), 7, 4)
+    assert paired.group[0] == paired.group[2]
+    assert len(set(paired.group.tolist())) == 3
+    # each reading keeps its own simulation row, never a collapsed canonical grid
+    assert paired.x[0, 0, 0] == pytest.approx(0.0)
+    assert paired.x[2, 0, 0] == pytest.approx(2.0)
+    assert paired.y[2, 0, 0] == 2.0
+    assert paired.n_sim_differ == 1
+    assert sorted(paired.group_sizes.tolist()) == [1, 1, 2]
 
 
-def test_taxel_dataset_from_csv_shapes_and_tensors(tiny_mesh_csv, tiny_taxel_csv):
-    dataset = TaxelDataset.from_csv(tiny_mesh_csv, tiny_taxel_csv)
-
-    assert len(dataset) == len(SAMPLE_KEYS)
-    assert dataset.mesh_shape == MESH_GRID_SHAPE
-    assert dataset.taxel_shape == TAXEL_GRID_SHAPE
-
-    mesh_tensor, taxel_tensor = dataset[0]
-
-    assert isinstance(mesh_tensor, torch.Tensor)
-    assert isinstance(taxel_tensor, torch.Tensor)
-    assert mesh_tensor.shape == (1, *MESH_GRID_SHAPE)
-    assert taxel_tensor.shape == tuple(TAXEL_GRID_SHAPE)
-    assert mesh_tensor.dtype == torch.float32
-    assert taxel_tensor.dtype == torch.float32
-
-    expected_mesh = expected_grid_array(SAMPLE_KEYS, MESH_GRID_SHAPE, mesh_value)[0]
-    expected_taxel = expected_grid_array(SAMPLE_KEYS, TAXEL_GRID_SHAPE, taxel_value)[0]
-    np.testing.assert_allclose(mesh_tensor.numpy()[0], expected_mesh)
-    np.testing.assert_allclose(taxel_tensor.numpy(), expected_taxel)
+def test_load_paired_rejects_row_misalignment(tmp_path):
+    sim_rows = [ROWS[1], ROWS[0], ROWS[2], ROWS[3]]
+    with pytest.raises(ValueError, match="2 rows have different force, Path, dataset"):
+        load_paired(_cfg(*write_pair(tmp_path, sim_rows=sim_rows)))
 
 
-def test_taxel_dataset_from_csv_strict_mismatch_raises(
-    tiny_mesh_csv, mismatched_taxel_csv
-):
-    with pytest.raises(ValueError):
-        TaxelDataset.from_csv(tiny_mesh_csv, mismatched_taxel_csv, strict=True)
+def test_load_paired_rejects_row_count_mismatch(tmp_path):
+    with pytest.raises(ValueError, match="has 4 rows but"):
+        load_paired(_cfg(*write_pair(tmp_path, sim_rows=ROWS[:3])))
 
 
-def _make_synthetic_samples(
-    n: int, mesh_shape: tuple[int, int], taxel_shape: tuple[int, int], seed: int = 0
-) -> list[JoinedSample]:
-    rng = np.random.default_rng(seed)
-    samples = []
-    for i in range(n):
-        samples.append(
-            JoinedSample(
-                object_name=f"obj_{i}",
-                force=float(i),
-                mesh=rng.standard_normal(mesh_shape).astype(np.float32),
-                taxel=rng.standard_normal(taxel_shape).astype(np.float32),
-            )
-        )
-    return samples
+def test_load_paired_rejects_dataset_mismatch(tmp_path):
+    sim_rows = [*ROWS[:3], ("3.5", "AForm/Horizontal", "04")]
+    with pytest.raises(ValueError, match="different"):
+        load_paired(_cfg(*write_pair(tmp_path, sim_rows=sim_rows)))
 
 
-def test_random_split_dataset_respects_val_ratio():
-    dataset = TaxelDataset(_make_synthetic_samples(10, (2, 2), (1, 2)))
+def test_taxel_dataset_items_and_batches(pair):
+    paired = load_paired(_cfg(*pair))
+    ds = TaxelDataset(paired, np.array([0, 2, 3]), transform_y=lambda y: y / 2)
 
-    train_subset, val_subset = random_split_dataset(dataset, val_ratio=0.2, seed=0)
+    x, y, g = ds[1]
+    assert x.shape == (1, 77, 49) and x.dtype == torch.float32
+    assert y.shape == (7, 4)
+    assert y[0, 0].item() == 1.0  # row 2 has value 2.0, halved
+    assert g.item() == paired.group[2]
+    xb, yb, gb = ds.__getitems__([0, 2])
+    assert xb.shape == (2, 1, 77, 49) and yb.shape == (2, 7, 4) and gb.shape == (2,)
 
-    assert len(train_subset) == 8
-    assert len(val_subset) == 2
-    assert len(train_subset) + len(val_subset) == len(dataset)
-    assert set(train_subset.indices).isdisjoint(set(val_subset.indices))
+
+def test_group_batch_sampler_keeps_groups_whole():
+    group = np.array([5, 1, 5, 2, 2, 2, 7, 1, 9])
+    sampler = GroupBatchSampler(group, groups_per_batch=2, seed=0)
+
+    batches = list(sampler)
+    assert len(batches) == len(sampler) == 3
+    seen = [i for b in batches for i in b]
+    assert sorted(seen) == list(range(len(group)))
+    for g in np.unique(group):
+        holding = [k for k, b in enumerate(batches) if any(group[i] == g for i in b)]
+        assert len(holding) == 1
+    assert all(len(np.unique(group[b])) <= 2 for b in batches)
 
 
-def test_random_split_dataset_is_reproducible_with_same_seed():
-    dataset = TaxelDataset(_make_synthetic_samples(10, (2, 2), (1, 2)))
-
-    train_a, val_a = random_split_dataset(dataset, val_ratio=0.3, seed=42)
-    train_b, val_b = random_split_dataset(dataset, val_ratio=0.3, seed=42)
-
-    assert list(train_a.indices) == list(train_b.indices)
-    assert list(val_a.indices) == list(val_b.indices)
+def test_group_batch_sampler_reshuffles_each_epoch():
+    group = np.arange(50)
+    sampler = GroupBatchSampler(group, groups_per_batch=10, seed=0)
+    assert list(sampler) != list(sampler)
