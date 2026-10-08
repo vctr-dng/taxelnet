@@ -3,25 +3,26 @@
 import torch
 from torch import nn
 
+from taxelnet.config import ModelConfig
+
 
 class CNNTaxelPredictor(nn.Module):
-    """Downsamples a fine mesh height-field grid to the taxel grid's resolution.
+    """V0: deterministic spatial CNN, downsampling the mesh grid to the taxel grid.
 
-    V1 baseline: the mesh deformation input and taxel output are both regular
-    2D grids (same kind of object, different resolution), so a CNN encoder
-    that exploits 2D locality is a better fit than a flatten+MLP (which
-    discards locality) or a GNN (which only earns its keep on irregular,
-    unknown connectivity -- not the case for a fixed lattice).
+    The mesh deformation input and taxel output are both regular 2D grids (same kind of
+    object, different resolution), so a CNN encoder that exploits 2D locality is a better
+    fit than a flatten+MLP (which discards locality) or a GNN (which only earns its keep
+    on irregular, unknown connectivity -- not the case for a fixed lattice).
 
-    A stack of conv + pooling blocks progressively downsamples the input
-    regardless of its exact resolution, then AdaptiveAvgPool2d forces the
-    exact target spatial size so the model doesn't need to know the
-    mesh/taxel resolution ratio in advance. A 1x1 conv collapses to a single
-    output channel.
+    A stack of conv + pooling blocks progressively downsamples the input regardless of
+    its exact resolution (77 x 49 -> 39 x 25 -> 20 x 13 -> 10 x 7 with 3 blocks), then
+    AdaptiveAvgPool2d forces the exact target spatial size (7 x 4) so the model doesn't
+    need to know the mesh/taxel resolution ratio in advance. Both grids share their
+    orientation, so adaptive pooling maps pad regions onto taxels consistently. A linear
+    1x1 conv head collapses to a single output channel.
 
-    Extension TODO (not implemented): a fuller U-Net-style decoder with skip
-    connections and learned upsampling, if this plain downsampling CNN
-    underfits once real data is available.
+    Extension TODO (V1): a U-Net-style decoder with skip connections and learned
+    upsampling, if this plain downsampling CNN underfits spatial detail.
     """
 
     def __init__(
@@ -49,6 +50,17 @@ class CNNTaxelPredictor(nn.Module):
         self.encoder = nn.Sequential(*blocks)
 
         self.resize = nn.AdaptiveAvgPool2d(taxel_shape)
+        # Linear head (no activation): baseline-corrected taxel values may be negative.
+        # It predicts the target in the space set by PreprocessingConfig.target_scaler:
+        # - identity: raw tactile counts. The loss is exactly raw-TC L1, but a head
+        #   initialized near 0 must climb to ~1,000 TC, so it trains slowly unless the
+        #   learning rate or bias initialization is adapted.
+        # - global_scale (chosen for V0): raw TC divided by one train-fitted scalar
+        #   (target std). L1 stays proportional to raw-TC MAE, so the estimand and the
+        #   taxel weighting of L_V0 are unchanged, while outputs are O(1).
+        # - per_taxel_zscore: per-taxel standardization. L1 then equals raw L1 weighted
+        #   by 1 / sigma_t, so quiet taxels are up-weighted: a different estimand
+        #   weighting, to be chosen deliberately.
         self.head = nn.Conv2d(in_channels, 1, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -57,3 +69,19 @@ class CNNTaxelPredictor(nn.Module):
         resized = self.resize(features)
         out = self.head(resized)
         return out.squeeze(1)
+
+
+MODELS = {"cnn_v0": CNNTaxelPredictor}
+
+
+def build_model(model_cfg: ModelConfig, taxel_shape: tuple[int, int]) -> nn.Module:
+    """Model registry entry point."""
+    if model_cfg.name not in MODELS:
+        raise ValueError(
+            f"unknown model {model_cfg.name!r}, expected one of {list(MODELS)}"
+        )
+    return MODELS[model_cfg.name](
+        taxel_shape=tuple(taxel_shape),
+        base_channels=model_cfg.base_channels,
+        num_down_blocks=model_cfg.num_down_blocks,
+    )
