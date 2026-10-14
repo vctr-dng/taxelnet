@@ -1,0 +1,13 @@
+{
+  "mcp": {
+    "code-review-graph": {
+      "type": "local",
+      "command": [
+        "code-review-graph",
+        "serve",
+        "--repo",
+        "./"
+      ]
+    }
+  }
+}
