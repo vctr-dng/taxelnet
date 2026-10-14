@@ -8,7 +8,12 @@ import torch
 from _helpers import ROWS, write_pair
 
 from taxelnet.config import DataConfig
-from taxelnet.dataset import GroupBatchSampler, TaxelDataset, load_paired
+from taxelnet.dataset import (
+    GroupBatchSampler,
+    TaxelDataset,
+    load_paired,
+    load_test_paired,
+)
 
 
 def _cfg(real_csv, sim_csv) -> DataConfig:
@@ -50,6 +55,22 @@ def test_load_paired_rejects_dataset_mismatch(tmp_path):
     sim_rows = [*ROWS[:3], ("3.5", "AForm/Horizontal", "04")]
     with pytest.raises(ValueError, match="different"):
         load_paired(_cfg(*write_pair(tmp_path, sim_rows=sim_rows)))
+
+
+def test_load_test_paired_reads_test_dir(grasp_pair):
+    real_csv, sim_csv = grasp_pair
+    cfg = DataConfig(
+        test_dir=real_csv.parent,
+        test_real_csv=real_csv.name,
+        test_sim_csv=sim_csv.name,
+        cache_dir=None,
+    )
+    test = load_test_paired(cfg)
+
+    assert (test.mesh_shape, test.taxel_shape) == ((77, 49), (7, 4))
+    assert len(test.groups) == len(test.group) == 20  # every grasp key is a singleton
+    assert test.files == (real_csv, sim_csv)
+    assert {g["dataset"] for g in test.groups} == {""}
 
 
 def test_taxel_dataset_items_and_batches(pair):

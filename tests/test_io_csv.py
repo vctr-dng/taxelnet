@@ -9,6 +9,7 @@ from _helpers import N_NODES, N_TAXELS, ROWS, write_pair
 from taxelnet.io_csv import (
     SIM_GRID_SHAPE,
     TAXEL_GRID_SHAPE,
+    TEST_KEY,
     read_real_table,
     read_sim_table,
     sim_node_columns,
@@ -112,3 +113,16 @@ def test_read_sim_table_cache_hit(tmp_path):
     np.testing.assert_array_equal(
         np.load(cached).reshape(first.values.shape), first.values
     )
+
+
+def test_readers_accept_test_schema(grasp_pair):
+    """Grasp files: `force, Name` key, no `dataset`, extra `std*` columns ignored."""
+    real_csv, sim_csv = grasp_pair
+    real = read_real_table(real_csv, TEST_KEY)
+    sim = read_sim_table(sim_csv, TEST_KEY)
+
+    assert real.values.shape == (20, *TAXEL_GRID_SHAPE)
+    assert sim.values.shape == (20, *SIM_GRID_SHAPE)
+    assert real.keys == sim.keys
+    assert real.keys[0] == (235.0, "Sphere_TestG_235_0_S1")
+    assert set(real.dataset) == set(sim.dataset) == {""}

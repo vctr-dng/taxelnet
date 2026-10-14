@@ -82,13 +82,18 @@ def synthetic_rows(n_keys: int = 60, seed: int = 0) -> list[tuple[str, str, str]
     return [rows[i] for i in order]
 
 
-def write_synthetic_pair(tmp_path: Path, n_keys: int = 60, seed: int = 0):
-    """A learnable pair: taxels are a block mean of the deformation grid plus noise."""
-    rows = synthetic_rows(n_keys, seed)
+def _synthetic_grids(n: int, seed: int) -> tuple[np.ndarray, np.ndarray]:
+    """Learnable grids: taxels are a block mean of the deformation grid plus noise."""
     rng = np.random.default_rng(seed)
-    sims = rng.random((len(rows), *SIM_GRID_SHAPE)) * 2.0 - 0.1
-    blocks = sims[:, :77, :48].reshape(len(rows), 7, 11, 4, 12).mean(axis=(2, 4))
-    reals = 1000.0 * blocks + rng.normal(0, 10, blocks.shape)
+    sims = rng.random((n, *SIM_GRID_SHAPE)) * 2.0 - 0.1
+    blocks = sims[:, :77, :48].reshape(n, 7, 11, 4, 12).mean(axis=(2, 4))
+    return sims, 1000.0 * blocks + rng.normal(0, 10, blocks.shape)
+
+
+def write_synthetic_pair(tmp_path: Path, n_keys: int = 60, seed: int = 0):
+    """A learnable pair with the training (indenter) schema."""
+    rows = synthetic_rows(n_keys, seed)
+    sims, reals = _synthetic_grids(len(rows), seed)
     return write_pair(
         tmp_path,
         sim_rows=rows,
@@ -96,3 +101,30 @@ def write_synthetic_pair(tmp_path: Path, n_keys: int = 60, seed: int = 0):
         real_rows=rows,
         real_value=lambda i: reals[i].ravel(),
     )
+
+
+def write_grasp_pair(out_dir: Path, n: int = 20, seed: int = 1) -> tuple[Path, Path]:
+    """A learnable pair with the test (grasp) schema: `force, Name`, no `dataset`, and
+    `std1 ... std28` after the taxels. Written to `out_dir`, created if needed."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    real_csv, sim_csv = out_dir / "grasp_real.csv", out_dir / "grasp_sim.csv"
+    sims, reals = _synthetic_grids(n, seed)
+    rows = [
+        (
+            "20.0" if i % 2 else "235.0",
+            f"Sphere_TestG_{'20' if i % 2 else '235'}_{i}_S1",
+        )
+        for i in range(n)
+    ]
+    std_cols = [f"std{k}" for k in range(1, N_TAXELS + 1)]
+    with real_csv.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["force", "Name", *taxel_columns(), *std_cols])
+        for row, real in zip(rows, reals):
+            writer.writerow([*row, *real.ravel().round(2), *[1.5] * N_TAXELS])
+    with sim_csv.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["force", "Name", *sim_node_columns()])
+        for row, sim in zip(rows, sims):
+            writer.writerow([*row, *sim.ravel().round(3)])
+    return real_csv, sim_csv

@@ -17,7 +17,7 @@ import torch
 
 from taxelnet.checkpoint import load_checkpoint, load_model
 from taxelnet.config import Configs, parse_configs
-from taxelnet.dataset import TaxelDataset, load_paired
+from taxelnet.dataset import TaxelDataset, load_test_paired
 from taxelnet.evaluation import predict
 from taxelnet.model import build_model
 from taxelnet.preprocessing import Preprocessor
@@ -72,13 +72,14 @@ def test_parse_configs_overrides():
     assert Configs().train.epochs != 2
 
 
-def test_run_training_two_epochs(tmp_path, synthetic_pair):
+def test_run_training_two_epochs(tmp_path, synthetic_pair, grasp_pair):
     real_csv, sim_csv = synthetic_pair
     cfgs = Configs()
     cfgs.data.data_dir = tmp_path
     cfgs.data.real_csv, cfgs.data.sim_csv = real_csv.name, sim_csv.name
     cfgs.data.cache_dir = tmp_path / "cache"
-    cfgs.data.test_manifest = tmp_path / "test_manifest.json"
+    cfgs.data.test_dir = grasp_pair[0].parent
+    cfgs.data.test_real_csv, cfgs.data.test_sim_csv = (f.name for f in grasp_pair)
     cfgs.train.epochs = 3
     cfgs.train.test_every = 2  # epoch 2, plus the last epoch
     cfgs.train.groups_per_batch = 8
@@ -95,6 +96,7 @@ def test_run_training_two_epochs(tmp_path, synthetic_pair):
     assert math.isfinite(metrics["test"]["micro_mae"])
     assert math.isfinite(metrics["test"]["macro_mae"])
     assert metrics["integrity"]["scalers_fitted_on"] == "train"
+    assert metrics["test"]["n_readings"] == 20
 
     preds = pl.read_parquet(result.run_dir / "predictions_test.parquet")
     assert preds.height == metrics["test"]["n_readings"]
@@ -111,6 +113,8 @@ def test_run_training_two_epochs(tmp_path, synthetic_pair):
     assert not (result.run_dir / "checkpoints" / "epoch_0001.pt").exists()
     assert run.data.params["train.epochs"] == "3"
     assert "sha256." + real_csv.name in run.data.tags
+    assert "sha256." + grasp_pair[0].name in run.data.tags
+    assert run.data.params["split.test_readings"] == "20"
     artifacts = {a.path for a in client.list_artifacts(result.run_id)}
     assert {"best.pt", "metrics.json", "split_manifest.json", "plots"} <= artifacts
     assert {a.path for a in client.list_artifacts(result.run_id, "plots")} == {
@@ -125,10 +129,11 @@ def test_run_training_two_epochs(tmp_path, synthetic_pair):
 
     # bundle round trip: best.pt and model.pt reproduce the evaluated predictions
     pre = Preprocessor.load(result.run_dir / "preprocessing.json")
-    paired = load_paired(cfgs.data)
+    test = load_test_paired(cfgs.data)
     test_rows = np.sort(preds["source_row"].to_numpy())
-    ds = TaxelDataset(paired, test_rows, pre.transform_x, pre.transform_y)
-    model = build_model(cfgs.model, paired.taxel_shape)
+    np.testing.assert_array_equal(test_rows, np.arange(len(test.group)))
+    ds = TaxelDataset(test, test_rows, pre.transform_x, pre.transform_y)
+    model = build_model(cfgs.model, test.taxel_shape)
     ckpt = load_checkpoint(result.run_dir / "best.pt", model)
     assert ckpt["mlflow_run_id"] == result.run_id
     assert ckpt["epoch"] == metrics["best_epoch"]
