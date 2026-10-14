@@ -32,6 +32,9 @@ def build_index(
 ) -> tuple[list[dict], int]:
     """One record per (force, Path) key pair, and the number of key pairs whose sim rows differ.
 
+    `path` holds the second key column (`Path` for training files, `Name` for test files);
+    `dataset` is "" when the files have no `dataset` column.
+
         {"force": 40.0, "path": "TriangleM/Lateral2", "dataset": "02",
          "sim_id": [123, 124, ...], "real_id": [123, 124, ...]}
 
@@ -70,7 +73,7 @@ def build_index(
         )
 
     if sim_values is None:
-        sim_values = load_sim_values(sim_csv)
+        sim_values = load_sim_values(sim_csv, key_cols)
     sim_values = sim_values.reshape(sim_values.shape[0], -1)
     index = []
     n_sim_differ = 0
@@ -98,6 +101,7 @@ class PairedData:
     group: np.ndarray  # (N,) int64 index into `groups`
     source_rows: np.ndarray  # (N,) 0-based CSV data row (identical in both files)
     groups: list[dict]  # build_index records: force, path, dataset, sim_id, real_id
+    files: tuple[Path, Path]  # (real_csv, sim_csv)
     n_sim_differ: int
 
     @property
@@ -113,14 +117,15 @@ class PairedData:
         return np.bincount(self.group, minlength=len(self.groups))
 
 
-def load_paired(data_cfg: DataConfig) -> PairedData:
+def load_paired_files(
+    real_csv: Path,
+    sim_csv: Path,
+    key_cols: list[str] = KEY,
+    cache_dir: Path | None = None,
+) -> PairedData:
     """Read, validate and pair both files; fails with a bounded report on any violation."""
-    real_csv = data_cfg.data_dir / data_cfg.real_csv
-    sim_csv = data_cfg.data_dir / data_cfg.sim_csv
-    key_cols = list(data_cfg.key_cols)
-
     real = read_real_table(real_csv, key_cols)
-    sim = read_sim_table(sim_csv, key_cols, data_cfg.cache_dir)
+    sim = read_sim_table(sim_csv, key_cols, cache_dir)
 
     if len(real.keys) != len(sim.keys):
         raise ValueError(
@@ -152,6 +157,27 @@ def load_paired(data_cfg: DataConfig) -> PairedData:
         source_rows=real.source_rows,
         groups=groups,
         n_sim_differ=n_sim_differ,
+        files=(real_csv, sim_csv),
+    )
+
+
+def load_paired(data_cfg: DataConfig) -> PairedData:
+    """The training pair (`data_dir`), split later into train and val."""
+    return load_paired_files(
+        data_cfg.data_dir / data_cfg.real_csv,
+        data_cfg.data_dir / data_cfg.sim_csv,
+        list(data_cfg.key_cols),
+        data_cfg.cache_dir,
+    )
+
+
+def load_test_paired(data_cfg: DataConfig) -> PairedData:
+    """The external test pair (`test_dir`), never used for fitting or model selection."""
+    return load_paired_files(
+        data_cfg.test_dir / data_cfg.test_real_csv,
+        data_cfg.test_dir / data_cfg.test_sim_csv,
+        list(data_cfg.test_key_cols),
+        data_cfg.cache_dir,
     )
 
 

@@ -16,16 +16,20 @@ import torch
 
 @dataclass
 class DataConfig:
-    data_dir: Path = Path("data/Indenters")
+    # training pair: split by (force, Path) group into train and val
+    data_dir: Path = Path("data/newton/v1/training")
     real_csv: str = "Dataset_Indenter_Real.csv"
     sim_csv: str = "Dataset_Indenter_Simulation.csv"
     key_cols: tuple[str, str] = ("force", "Path")
     val_ratio: float = 0.1
-    test_ratio: float = 0.1
     split_seed: int = 0
-    # immutable test split: created on first run, reused by every later run
-    test_manifest: Path = Path("splits/test_manifest.json")
-    cache_dir: Path | None = Path("data/Indenters/.cache")
+    # external test pair (grasp export): evaluated only, never split or fitted on
+    test_dir: Path = Path("data/newton/v1/test")
+    test_real_csv: str = "Dataset_Grasp_Real_qtac100_testing.csv"
+    test_sim_csv: str = "Dataset_Grasp_Simulation_qtac100_testing.csv"
+    test_key_cols: tuple[str, str] = ("force", "Name")
+    # parsed simulation grids, keyed by CSV checksum (shared by train and test files)
+    cache_dir: Path | None = Path("data/newton/v1/training/.cache")
 
 
 @dataclass

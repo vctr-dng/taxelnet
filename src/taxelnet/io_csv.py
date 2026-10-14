@@ -1,8 +1,12 @@
-"""Schema-aware CSV -> GridTable parsing for the matched indenter files.
+"""Schema-aware CSV -> GridTable parsing for the matched real/simulation files.
 
-The matched indenter export (`data/Indenters`, see Dataset_Indenter_README.pdf) is two
-row-aligned files: row i of the real file and row i of the simulation file are the same
-press. Both start with the text columns `force, Path, dataset`.
+A matched export is two row-aligned files: row i of the real file and row i of the
+simulation file are the same press. Both start with the same text key columns.
+
+- Training (`data/newton/v1/training`, see Dataset_Indenter_README.pdf): the indenter
+  export, `force, Path, dataset`.
+- Test (`data/newton/v1/test`): the grasp export, `force, Name` (no `dataset`); its real
+  file also has `std1 ... std28` columns, which are ignored.
 """
 
 from __future__ import annotations
@@ -16,12 +20,16 @@ import polars as pl
 
 REAL_CSV = "Dataset_Indenter_Real.csv"
 SIM_CSV = "Dataset_Indenter_Simulation.csv"
+TEST_REAL_CSV = "Dataset_Grasp_Real_qtac100_testing.csv"
+TEST_SIM_CSV = "Dataset_Grasp_Simulation_qtac100_testing.csv"
 
-KEY = ["force", "Path"]  # matching key of a press
-DATASET_COL = "dataset"  # zero-padded real dataset id ("01", ...): provenance, not part of the key
-META_COLS = [*KEY, DATASET_COL]
+KEY = ["force", "Path"]  # matching key of a training press
+TEST_KEY = ["force", "Name"]  # matching key of a test (grasp) press
+# zero-padded real dataset id ("01", ...): provenance, not part of the key; optional
+DATASET_COL = "dataset"
+META_COLS = [*KEY, DATASET_COL]  # training-file meta columns
 
-# grids, row-major as stored (see data/Indenters/Plot_matched_dataset.py)
+# grids, row-major as stored (see data/newton/v1/training/Plot_matched_dataset.py)
 SIM_GRID_SHAPE = (77, 49)  # simulated nodes: rows along X, columns along Y
 TAXEL_GRID_SHAPE = (7, 4)  # real taxels: tax1..tax4 is the first row
 X_MIN, X_MAX, Y_MIN, Y_MAX = 1.798, 41.802, -27.001, -1.499  # node rest positions (mm)
@@ -51,9 +59,28 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def csv_header(csv: Path) -> list[str]:
+    return pl.read_csv(csv, n_rows=0).columns
+
+
 def read_matched_csv(csv: Path, columns: list[str] | None = None) -> pl.DataFrame:
-    """Read a matched real or simulation CSV, keeping `dataset` as a string."""
-    return pl.read_csv(csv, columns=columns, schema_overrides={DATASET_COL: pl.String})
+    """Read a matched real or simulation CSV, keeping `dataset` (if any) as a string.
+
+    A file without `dataset` gets an empty-string `dataset` column, so every reader sees
+    the same meta columns.
+    """
+    header = csv_header(csv)
+    has_dataset = DATASET_COL in header
+    if columns is not None and not has_dataset:
+        columns = [c for c in columns if c != DATASET_COL]
+    df = pl.read_csv(
+        csv,
+        columns=columns,
+        schema_overrides={DATASET_COL: pl.String} if has_dataset else None,
+    )
+    if not has_dataset:
+        df = df.with_columns(pl.lit("").alias(DATASET_COL))
+    return df
 
 
 def check_force_decimals(df: pl.DataFrame, name: str, force_col: str = "force") -> None:
@@ -98,10 +125,10 @@ def _check_finite(name: str, values: np.ndarray) -> None:
         )
 
 
-def load_sim_values(csv: Path) -> np.ndarray:
+def load_sim_values(csv: Path, key_cols: list[str] = KEY) -> np.ndarray:
     """Node values of every simulation row, shape (n_rows, n_nodes), in stored node order."""
     df = read_matched_csv(csv)
-    node_cols = [c for c in df.columns if c not in META_COLS]
+    node_cols = [c for c in df.columns if c not in [*key_cols, DATASET_COL]]
     if node_cols != sim_node_columns():
         raise ValueError(
             f"{csv.name}: node columns are not n195 ... n14899 in row-major order "
@@ -115,8 +142,8 @@ def load_sim_values(csv: Path) -> np.ndarray:
 class GridTable:
     """One record per CSV data row; records are never collapsed."""
 
-    keys: list[tuple[float, str]]  # raw (force, Path) per row; repeats allowed
-    dataset: list[str]  # provenance, not part of the key
+    keys: list[tuple[float, str]]  # raw (force, Path|Name) per row; repeats allowed
+    dataset: list[str]  # provenance, not part of the key; "" when the file has none
     values: np.ndarray  # (N, H, W) float32
     grid_shape: tuple[int, int]
     source_rows: np.ndarray  # 0-based CSV data-row index of each record
@@ -132,10 +159,14 @@ def _meta(csv: Path, key_cols: list[str]) -> tuple[list[tuple[float, str]], list
 
 
 def read_real_table(csv: Path, key_cols: list[str] = KEY) -> GridTable:
-    """Real tactile file: `force, Path, dataset, tax1 ... tax28` -> (N, 7, 4), no flip."""
+    """Real tactile file: `force, Path, dataset, tax1 ... tax28` -> (N, 7, 4), no flip.
+
+    Only the `tax*` columns are read as values; other columns (the test file's `std*`)
+    are ignored.
+    """
     df = read_matched_csv(csv)
     _check_columns(
-        csv.name, [c for c in df.columns if c not in [*key_cols, DATASET_COL]],
+        csv.name, [c for c in df.columns if c.startswith("tax")],
         taxel_columns(), "taxel",
     )  # fmt: skip
     values = df.select(taxel_columns()).cast(pl.Float32).to_numpy()
@@ -164,7 +195,7 @@ def read_sim_table(
     if cache is not None and cache.exists():
         values = np.load(cache)
     else:
-        values = load_sim_values(csv)
+        values = load_sim_values(csv, key_cols)
         if cache is not None:
             cache.parent.mkdir(parents=True, exist_ok=True)
             np.save(cache, values)

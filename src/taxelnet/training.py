@@ -8,7 +8,6 @@ group; groups are then averaged equally (or with weight n_g ** alpha, an ablatio
 
 from __future__ import annotations
 
-import json
 import math
 import random
 import time
@@ -30,7 +29,13 @@ from taxelnet.checkpoint import (
     save_model,
 )
 from taxelnet.config import Configs, TrainConfig
-from taxelnet.dataset import GroupBatchSampler, PairedData, TaxelDataset, load_paired
+from taxelnet.dataset import (
+    GroupBatchSampler,
+    PairedData,
+    TaxelDataset,
+    load_paired,
+    load_test_paired,
+)
 from taxelnet.evaluation import (
     compute_metrics,
     predict,
@@ -41,7 +46,7 @@ from taxelnet.io_csv import file_sha256
 from taxelnet.model import build_model
 from taxelnet.plots import save_inference_plots, select_plot_samples
 from taxelnet.preprocessing import Preprocessor
-from taxelnet.splits import PARTITIONS, Split, make_split, split_manifest
+from taxelnet.splits import PARTITIONS, TEST, make_split, shared_keys, split_manifest
 
 Logger = Callable[[dict[str, float], int], object]
 # called with (epoch, model, checkpoint path) after each periodic checkpoint
@@ -213,51 +218,43 @@ def _seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
 
 
-def _check_test_coverage(
-    paired: PairedData, split: Split, test_rows: np.ndarray
-) -> None:
-    """The evaluated rows exactly cover the immutable test manifest."""
-    manifest = json.loads(split.test_manifest_path.read_text())
-    expected = {(float(f), p) for f, p in manifest["keys"]}
-    got = {
-        (float(paired.groups[g]["force"]), paired.groups[g]["path"])
-        for g in np.unique(paired.group[test_rows])
-    }
-    expected_rows = sum(
-        len(r["real_id"]) for r in paired.groups if (r["force"], r["path"]) in expected
-    )
-    if got != expected or len(test_rows) != expected_rows:
-        raise AssertionError("test predictions do not cover the test manifest exactly")
-
-
 def run_training(cfgs: Configs) -> RunResult:
-    """Data -> split -> train-only preprocessing -> fit -> test evaluation -> bundle,
-    all tracked in one MLflow run."""
+    """Training data -> train/val split -> train-only preprocessing -> fit -> evaluation
+    on the external test pair -> bundle, all tracked in one MLflow run."""
     _seed_everything(cfgs.train.seed)
     data = cfgs.data
-    real_csv, sim_csv = data.data_dir / data.real_csv, data.data_dir / data.sim_csv
-    checksums = {
-        data.real_csv: file_sha256(real_csv),
-        data.sim_csv: file_sha256(sim_csv),
-    }
 
     paired = load_paired(data)
-    split = make_split(paired, data, checksums[data.real_csv])
+    test = load_test_paired(data)
+    if (test.mesh_shape, test.taxel_shape) != (paired.mesh_shape, paired.taxel_shape):
+        raise ValueError(
+            f"test grids {test.mesh_shape} -> {test.taxel_shape} differ from training "
+            f"grids {paired.mesh_shape} -> {paired.taxel_shape}"
+        )
+    shared = shared_keys(paired, test)
+    if shared:
+        raise ValueError(
+            f"{len(shared)} test keys also occur in the training data, e.g. {shared[:5]}"
+        )
+    checksums = {f.name: file_sha256(f) for f in (*paired.files, *test.files)}
+
+    split = make_split(paired, data)
     train_rows = split.rows["train"]
     pre = Preprocessor.fit(
         cfgs.preprocessing, paired.x[train_rows], paired.y[train_rows]
     )
     device = cfgs.train.device
-    ds = {
-        p: TaxelDataset(paired, split.rows[p], pre.transform_x, pre.transform_y).to(
-            device
-        )
-        for p in PARTITIONS
+    # partition -> (paired data, rows): train/val from the training pair, test external
+    sources: dict[str, tuple[PairedData, np.ndarray]] = {
+        **{p: (paired, split.rows[p]) for p in PARTITIONS},
+        TEST: (test, np.arange(len(test.group))),
     }
-    for p in PARTITIONS:
-        print(
-            f"{p}: {len(ds[p])} readings, {len(np.unique(paired.group[split.rows[p]]))} groups"
-        )
+    ds = {
+        p: TaxelDataset(src, rows, pre.transform_x, pre.transform_y).to(device)
+        for p, (src, rows) in sources.items()
+    }
+    for p, (src, rows) in sources.items():
+        print(f"{p}: {len(ds[p])} readings, {len(np.unique(src.group[rows]))} groups")
 
     model = build_model(cfgs.model, paired.taxel_shape).to(device)
     out = model(ds["train"].x[:1])
@@ -296,7 +293,9 @@ def run_training(cfgs: Configs) -> RunResult:
                 "data.mesh_grid_shape": list(paired.mesh_shape),
                 "data.taxel_grid_shape": list(paired.taxel_shape),
                 "data.orientation": "tax1/n195 top-left; rows along X; no flip",
-                **{f"split.{p}_readings": len(split.rows[p]) for p in PARTITIONS},
+                **{
+                    f"split.{p}_readings": len(rows) for p, (_, rows) in sources.items()
+                },
                 "artifact_contract_version": ARTIFACT_CONTRACT_VERSION,
             }
         )
@@ -311,24 +310,29 @@ def run_training(cfgs: Configs) -> RunResult:
 
         artifacts.write_json(run_dir / "config.json", cfgs.to_dict())
         artifacts.write_json(
-            run_dir / "schema_report.json", artifacts.schema_report(paired, checksums)
+            run_dir / "schema_report.json",
+            {
+                "train": artifacts.schema_report(paired, checksums),
+                TEST: artifacts.schema_report(test, checksums, exclusions=None),
+            },
         )
         artifacts.write_json(
             run_dir / "split_manifest.json",
-            split_manifest(paired, split, data, cfgs.train.group_weight_alpha),
+            split_manifest(
+                paired, split, data, test, checksums, cfgs.train.group_weight_alpha
+            ),
         )
         pre.save(run_dir / "preprocessing.json")
         artifacts.write_node_ids_csv(run_dir / "node_ids.csv")
         artifacts.write_requirements_lock(run_dir / "requirements.lock.txt")
 
-        test_rows = split.rows["test"]
-        test_target, test_group = paired.y[test_rows], paired.group[test_rows]
+        test_target, test_group = test.y, test.group
         plot_pos = select_plot_samples(test_target, cfgs.eval.plot_samples)
         plot_titles = [
-            "{path} @ {force:g} N (row {row})".format(
-                **paired.groups[paired.group[r]], row=paired.source_rows[r]
+            "{path} @ {force:g} (row {row})".format(
+                **test.groups[test.group[r]], row=test.source_rows[r]
             )
-            for r in test_rows[plot_pos]
+            for r in plot_pos
         ]
 
         def evaluate_test(model: nn.Module, name: str, title: str) -> dict:
@@ -339,7 +343,7 @@ def run_training(cfgs: Configs) -> RunResult:
             )
             out = run_dir / "plots" / name
             save_inference_plots(
-                out, paired.x[test_rows], test_target, pred, m, plot_pos,
+                out, test.x, test_target, pred, m, plot_pos,
                 plot_titles, title,
             )  # fmt: skip
             artifacts.write_json(out / "test_metrics.json", m)
@@ -386,23 +390,25 @@ def run_training(cfgs: Configs) -> RunResult:
             "units": "tactile counts (TC); MSE in TC^2",
             "note": "deterministic V0: CRPS = MAE, energy score = Euclidean error",
         }
-        for p in ("val", "test"):
-            rows = split.rows[p]
+        for p in ("val", TEST):
+            src, rows = sources[p]
             pred = predict(model, ds[p], pre)
-            target, group = paired.y[rows], paired.group[rows]
+            target, group = src.y[rows], src.group[rows]
             metrics[p] = compute_metrics(pred, target, group, cfgs.eval.ssim_data_range)
             metrics[p]["reference"] = reference_points(target, group)
-            if p == "test":
-                _check_test_coverage(paired, split, rows)
-                predictions_frame(paired, rows, p, pred).write_parquet(
+            if p == TEST:
+                if len(pred) != len(test.group):
+                    raise AssertionError("test predictions do not cover the test file")
+                predictions_frame(src, rows, p, pred).write_parquet(
                     run_dir / "predictions_test.parquet"
                 )
         metrics["integrity"] = {
             "scalers_fitted_on": pre.fitted_on,
             "scaler_fit_rows": pre.n_fit_rows,
             "train_rows": len(train_rows),
-            "test_covers_manifest": True,
-            "partitions_disjoint": True,
+            "test_predictions_cover_test_file": True,
+            "train_val_disjoint": True,
+            "test_keys_disjoint_from_training": True,
         }
         assert pre.n_fit_rows == len(train_rows)
         artifacts.write_json(run_dir / "metrics.json", metrics)

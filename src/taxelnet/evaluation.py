@@ -120,7 +120,10 @@ def reference_points(target: np.ndarray, group: np.ndarray) -> dict:
 def predictions_frame(
     paired: PairedData, rows: np.ndarray, partition: str, pred: np.ndarray
 ) -> pl.DataFrame:
-    """One record per real target: raw key, partition, provenance, target, pred, residual."""
+    """One record per real target: raw key, partition, provenance, target, pred, residual.
+
+    `path` is the second key column (`Path` in training files, `Name` in the test file).
+    """
     target = paired.y[rows].reshape(len(rows), -1)
     flat_pred = pred.reshape(len(rows), -1)
     groups = [paired.groups[g] for g in paired.group[rows]]

@@ -15,7 +15,7 @@ from taxelnet.io_csv import SIM_GRID_SHAPE, sim_node_columns
 KEY_PACKAGES = ("taxelnet", "torch", "numpy", "polars", "mlflow")
 
 # Real presses left out of the matched export, as reported by Dataset_Indenter_README.pdf.
-# Unmatched_real.txt, which lists them, is not in data/Indenters.
+# Unmatched_real.txt, which lists them, is not in data/newton/v1/training.
 README_EXCLUSIONS = {
     "source": "Dataset_Indenter_README.pdf; Unmatched_real.txt not available",
     "total": 688,
@@ -73,12 +73,17 @@ def git_revision(cwd: Path | None = None) -> dict[str, Any]:
         return {"commit": "unknown", "dirty": None}
 
 
-def schema_report(paired: PairedData, checksums: dict[str, str]) -> dict[str, Any]:
+def schema_report(
+    paired: PairedData,
+    checksums: dict[str, str],
+    exclusions: dict[str, Any] | None = README_EXCLUSIONS,
+) -> dict[str, Any]:
+    """Shape, size and value-range summary of one matched pair (training or test)."""
     sizes = paired.group_sizes
     repeated = sizes >= 2
     paths = {g["path"] for g in paired.groups}
     return {
-        "files": checksums,
+        "files": {f.name: checksums[f.name] for f in paired.files},
         "n_rows": len(paired.group),
         "n_keys": len(paired.groups),
         "n_paths": len(paths),
@@ -87,7 +92,7 @@ def schema_report(paired: PairedData, checksums: dict[str, str]) -> dict[str, An
         "n_readings_in_repeated_keys": int(sizes[repeated].sum()),
         "max_group_size": int(sizes.max()),
         "n_keys_with_differing_sim_rows": paired.n_sim_differ,
-        "datasets": sorted({g["dataset"] for g in paired.groups}),
+        "datasets": sorted({g["dataset"] for g in paired.groups} - {""}),
         "sim": {
             "grid_shape": list(paired.mesh_shape),
             "units": "mm",
@@ -106,5 +111,5 @@ def schema_report(paired: PairedData, checksums: dict[str, str]) -> dict[str, An
             "min": float(min(g["force"] for g in paired.groups)),
             "max": float(max(g["force"] for g in paired.groups)),
         },
-        "excluded": README_EXCLUSIONS,
+        "excluded": exclusions,
     }

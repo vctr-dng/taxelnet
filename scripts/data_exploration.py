@@ -155,7 +155,7 @@ def _():
 
 @app.cell
 def _(META_COLS, REAL_CSV, SIM_CSV, mo, read_matched_csv):
-    data_dir = mo.notebook_dir().parent / "data" / "Indenters"
+    data_dir = mo.notebook_dir().parent / "data" / "newton" / "v1" / "training"
     real_df = read_matched_csv(data_dir / REAL_CSV)
     sim_df = read_matched_csv(data_dir / SIM_CSV)
     NODE_COLS = [c for c in sim_df.columns if c not in META_COLS]  # n195 ... n14899

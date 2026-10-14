@@ -1,6 +1,6 @@
 """Build <data-dir>/index.json: one record per (force, Path) key pair (see taxelnet.dataset.build_index).
 
-Usage: uv run python scripts/build_index.py [--data-dir data/Indenters]
+Usage: uv run python scripts/build_index.py [--data-dir data/newton/v1/training]
 """
 
 import argparse
@@ -10,7 +10,9 @@ from pathlib import Path
 from taxelnet.dataset import build_index
 from taxelnet.io_csv import REAL_CSV, SIM_CSV
 
-DEFAULT_DATA_DIR = Path(__file__).resolve().parents[1] / "data" / "Indenters"
+DEFAULT_DATA_DIR = (
+    Path(__file__).resolve().parents[1] / "data" / "newton" / "v1" / "training"
+)
 
 
 def main() -> None:

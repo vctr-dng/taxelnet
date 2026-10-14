@@ -1,25 +1,23 @@
-"""Seeded, weighted group-level train/val/test allocation and split manifests.
+"""Seeded, weighted group-level train/val allocation and split manifests.
 
 A full raw (force, Path) group is indivisible: all its presses go to one partition. Group
-weight is its number of real readings. The test partition is persisted once as an immutable
-manifest and reused by every later run, so regression gates compare runs on one test set.
+weight is its number of real readings. The test set is not carved from the training data:
+it is the external pair in `DataConfig.test_dir`, identical for every run.
 """
 
 from __future__ import annotations
 
-import json
 from collections import Counter
 from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
 
 from taxelnet.config import DataConfig
 from taxelnet.dataset import PairedData
-from taxelnet.io_csv import MAX_REPORTED
 
-PARTITIONS = ("train", "val", "test")
-MANIFEST_VERSION = 1
+PARTITIONS = ("train", "val")  # carved from the training pair
+TEST = "test"  # the external test pair
+MANIFEST_VERSION = 2
 
 
 def allocate_groups(
@@ -59,85 +57,39 @@ def _key(record: dict) -> tuple[float, str]:
 class Split:
     partition: np.ndarray  # partition name per group
     rows: dict[str, np.ndarray]  # sorted data rows per partition
-    test_manifest_path: Path
-    test_manifest_created: bool
 
 
-def make_split(paired: PairedData, data_cfg: DataConfig, real_sha256: str) -> Split:
-    """Train/val/test per group, reusing (or creating) the immutable test manifest."""
-    sizes = paired.group_sizes
+def make_split(paired: PairedData, data_cfg: DataConfig) -> Split:
+    """Seeded train/val allocation of the training groups (no test carve-out)."""
     keys = [_key(r) for r in paired.groups]
-    key_to_group = {k: g for g, k in enumerate(keys)}
-    path = data_cfg.test_manifest
-
-    if path.exists():
-        manifest = json.loads(path.read_text())
-        test_keys = [(float(f), p) for f, p in manifest["keys"]]
-        missing = [k for k in test_keys if k not in key_to_group]
-        if missing:
-            raise ValueError(
-                f"{path}: {len(missing)} test keys are not in the data, "
-                f"e.g. {missing[:MAX_REPORTED]}"
-            )
-        if manifest.get("real_csv_sha256") != real_sha256:
-            raise ValueError(
-                f"{path} was made from a different real CSV "
-                f"({manifest.get('real_csv_sha256')} != {real_sha256}); runs on different "
-                "test manifests are not comparable. Move it aside to start a new test set."
-            )
-        partition = np.full(len(keys), None, dtype=object)
-        test_groups = np.array([key_to_group[k] for k in test_keys], dtype=np.int64)
-        partition[test_groups] = "test"
-        rest = np.flatnonzero([p is None for p in partition])
-        val_share = data_cfg.val_ratio / (1 - data_cfg.test_ratio)
-        partition[rest] = allocate_groups(
-            sizes[rest], {"train": 1 - val_share, "val": val_share}, data_cfg.split_seed
-        )
-        created = False
-    else:
-        partition = allocate_groups(
-            sizes,
-            {
-                "train": 1 - data_cfg.val_ratio - data_cfg.test_ratio,
-                "val": data_cfg.val_ratio,
-                "test": data_cfg.test_ratio,
-            },
-            data_cfg.split_seed,
-        )
-        test_keys = sorted(k for k, p in zip(keys, partition) if p == "test")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(
-                {
-                    "version": MANIFEST_VERSION,
-                    "description": "Immutable Taxelnet test split: raw (force, Path) keys",
-                    "real_csv": data_cfg.real_csv,
-                    "real_csv_sha256": real_sha256,
-                    "seed": data_cfg.split_seed,
-                    "test_ratio": data_cfg.test_ratio,
-                    "n_groups": len(test_keys),
-                    "n_readings": int(sizes[partition == "test"].sum()),
-                    "keys": [[f, p] for f, p in test_keys],
-                },
-                indent=1,
-            )
-        )
-        created = True
-
+    partition = allocate_groups(
+        paired.group_sizes,
+        {"train": 1 - data_cfg.val_ratio, "val": data_cfg.val_ratio},
+        data_cfg.split_seed,
+    )
     key_sets = {p: {k for k, q in zip(keys, partition) if q == p} for p in PARTITIONS}
-    for i, a in enumerate(PARTITIONS):
-        for b in PARTITIONS[i + 1 :]:
-            assert key_sets[a].isdisjoint(key_sets[b]), f"{a} and {b} share keys"
+    assert key_sets["train"].isdisjoint(key_sets["val"]), "train and val share keys"
 
     row_partition = partition[paired.group]
     rows = {p: np.flatnonzero(row_partition == p) for p in PARTITIONS}
-    return Split(partition, rows, path, created)
+    return Split(partition, rows)
+
+
+def shared_keys(paired: PairedData, test: PairedData) -> list[tuple[float, str]]:
+    """Raw keys present in both the training pair and the external test pair."""
+    train_keys = {_key(r) for r in paired.groups}
+    return sorted(k for k in (_key(r) for r in test.groups) if k in train_keys)
 
 
 def split_manifest(
-    paired: PairedData, split: Split, data_cfg: DataConfig, alpha: float = 0.0
+    paired: PairedData,
+    split: Split,
+    data_cfg: DataConfig,
+    test: PairedData,
+    checksums: dict[str, str],
+    alpha: float = 0.0,
 ) -> dict:
-    """Per-group partition record, partition counts, and per-path weight shares."""
+    """Per-group partition record, partition counts, per-path weight shares, test files."""
     sizes = paired.group_sizes
     groups = [
         {
@@ -183,13 +135,16 @@ def split_manifest(
         "seed": data_cfg.split_seed,
         "config": {
             "val_ratio": data_cfg.val_ratio,
-            "test_ratio": data_cfg.test_ratio,
             "split_strategy": "group",
-            "test_manifest": str(split.test_manifest_path),
-            "test_manifest_created": split.test_manifest_created,
             "group_weight_alpha": alpha,
         },
         "counts": counts,
+        "test": {
+            "files": {f.name: checksums[f.name] for f in test.files},
+            "key_cols": list(data_cfg.test_key_cols),
+            "groups": len(test.groups),
+            "readings": len(test.group),
+        },
         "train_path_weight_share": path_share,
         "groups": groups,
     }
