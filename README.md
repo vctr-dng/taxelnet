@@ -1,5 +1,18 @@
 # Taxelnet
 
+Digital twin of a capacitive tactile sensor.
+
+## Contributing
+
+### pre-commit
+
+This project uses [pre-commit](https://pre-commit.com/) :
+
+```bash
+uv tool install pre-commit --with pre-commit-uv
+pre-commit install
+```
+
 ### AI Usage
 
 This project leverages AI agents and LLM to accelerate its development.
