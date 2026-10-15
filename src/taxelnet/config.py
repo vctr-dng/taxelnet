@@ -70,6 +70,9 @@ class TrainConfig:
     # metrics of that model, and inference plots. 0 disables. Monitoring only: best.pt is
     # always selected on validation, never on test.
     test_every: int = 10
+    # L1 penalty on the mean |CNN residual| (scaled target units) of hybrid models that
+    # expose `model.residual` (footprint_cnn); 0 disables
+    residual_l1_weight: float = 0.0
 
 
 @dataclass

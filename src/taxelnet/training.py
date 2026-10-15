@@ -89,14 +89,20 @@ def train_one_epoch(
     sampler: GroupBatchSampler,
     optimizer: Optimizer,
     alpha: float = 0.0,
+    residual_l1_weight: float = 0.0,
 ) -> float:
-    """Group-balanced loss (scaled target space), averaged over the epoch's groups."""
+    """Group-balanced loss (scaled target space), averaged over the epoch's groups.
+
+    With `residual_l1_weight` > 0, adds that weight times the mean |model.residual|
+    (hybrid models only)."""
     model.train()
     total, n_groups = 0.0, 0
     for batch in sampler:
         idx = torch.as_tensor(batch, device=ds.x.device)
         x, y, group = ds.__getitems__(idx)
         loss = group_balanced_l1(model(x), y, group, alpha)
+        if residual_l1_weight > 0:
+            loss = loss + residual_l1_weight * model.residual.abs().mean()
         if not torch.isfinite(loss):
             raise FloatingPointError(f"non-finite training loss {loss.item()}")
         optimizer.zero_grad(set_to_none=True)
@@ -161,7 +167,9 @@ def fit(
 
     for epoch in range(1, train_cfg.epochs + 1):
         lr = optimizer.param_groups[0]["lr"]
-        train_one_epoch(model, train_ds, sampler, optimizer, alpha)
+        train_one_epoch(
+            model, train_ds, sampler, optimizer, alpha, train_cfg.residual_l1_weight
+        )
         if scheduler is not None:
             scheduler.step()
         train_m = evaluate_loss(model, train_ds, pre, alpha)
@@ -411,6 +419,9 @@ def run_training(cfgs: Configs) -> RunResult:
 
         load_checkpoint(run_dir / "best.pt", model, map_location=device)
         save_model(run_dir / "model.pt", model, cfgs.model, paired.taxel_shape)
+        if hasattr(model, "report"):  # physics models: learned params + footprint plot
+            phys = model.report(run_dir)
+            mlflow.log_metrics({f"final_phys_{k}": v for k, v in phys.items()})
         evaluate_test(model, "best", f"test, best model (epoch {history.best_epoch})")
 
         metrics: dict = {

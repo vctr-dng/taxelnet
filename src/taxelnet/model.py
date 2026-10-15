@@ -73,6 +73,14 @@ class CNNTaxelPredictor(nn.Module):
 
 MODELS = {"cnn_v0": CNNTaxelPredictor}
 
+# physics-structured readout (plan D1/D2), in its own module
+from taxelnet.model_physics import (  # noqa: E402
+    FootprintCNNTaxelPredictor,
+    FootprintTaxelPredictor,
+)
+
+MODELS |= {"footprint": FootprintTaxelPredictor, "footprint_cnn": FootprintCNNTaxelPredictor}
+
 
 def build_model(model_cfg: ModelConfig, taxel_shape: tuple[int, int]) -> nn.Module:
     """Model registry entry point."""
