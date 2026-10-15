@@ -38,6 +38,7 @@ from taxelnet.dataset import (
 )
 from taxelnet.evaluation import (
     compute_metrics,
+    object_metrics,
     predict,
     predictions_frame,
     reference_points,
@@ -239,6 +240,8 @@ def run_training(cfgs: Configs) -> RunResult:
     checksums = {f.name: file_sha256(f) for f in (*paired.files, *test.files)}
 
     split = make_split(paired, data)
+    if split.held_out_shapes:
+        print(f"held-out val shapes: {', '.join(split.held_out_shapes)}")
     train_rows = split.rows["train"]
     pre = Preprocessor.fit(
         cfgs.preprocessing, paired.x[train_rows], paired.y[train_rows]
@@ -296,6 +299,8 @@ def run_training(cfgs: Configs) -> RunResult:
                 **{
                     f"split.{p}_readings": len(rows) for p, (_, rows) in sources.items()
                 },
+                "split.held_out_shapes": ",".join(split.held_out_shapes) or "none",
+                "split.n_held_out_shapes": len(split.held_out_shapes),
                 "artifact_contract_version": ARTIFACT_CONTRACT_VERSION,
             }
         )
@@ -327,6 +332,7 @@ def run_training(cfgs: Configs) -> RunResult:
         artifacts.write_requirements_lock(run_dir / "requirements.lock.txt")
 
         test_target, test_group = test.y, test.group
+        test_names = [test.groups[g]["path"] for g in test_group]
         plot_pos = select_plot_samples(test_target, cfgs.eval.plot_samples)
         plot_titles = [
             "{path} @ {force:g} (row {row})".format(
@@ -341,6 +347,7 @@ def run_training(cfgs: Configs) -> RunResult:
             m = compute_metrics(
                 pred, test_target, test_group, cfgs.eval.ssim_data_range
             )
+            m |= object_metrics(pred, test_target, test_group, test_names)
             out = run_dir / "plots" / name
             save_inference_plots(
                 out, test.x, test_target, pred, m, plot_pos,
@@ -353,8 +360,24 @@ def run_training(cfgs: Configs) -> RunResult:
         def on_checkpoint(epoch: int, model: nn.Module, path: Path) -> None:
             # monitoring only: best.pt is selected on validation, never on test
             m = evaluate_test(model, f"epoch_{epoch:04d}", f"test, epoch {epoch}")
+            # decomposed val metrics at the same epochs (val_micro/macro_mae are
+            # already logged every epoch by fit)
+            vsrc, vrows = sources["val"]
+            vm = compute_metrics(
+                predict(model, ds["val"], pre),
+                vsrc.y[vrows],
+                vsrc.group[vrows],
+                cfgs.eval.ssim_data_range,
+            )
             mlflow.log_metrics(
-                {f"test_{k}": v for k, v in m.items() if isinstance(v, float)},
+                {
+                    **{f"test_{k}": v for k, v in m.items() if isinstance(v, float)},
+                    **{
+                        f"val_{k}": v
+                        for k, v in vm.items()
+                        if isinstance(v, float) and k not in ("micro_mae", "macro_mae")
+                    },
+                },
                 step=epoch,
             )
             mlflow.log_artifact(str(path), "checkpoints")
@@ -397,6 +420,9 @@ def run_training(cfgs: Configs) -> RunResult:
             metrics[p] = compute_metrics(pred, target, group, cfgs.eval.ssim_data_range)
             metrics[p]["reference"] = reference_points(target, group)
             if p == TEST:
+                obj = object_metrics(pred, target, group, test_names)
+                metrics[p]["reference"]["trivial_zero"] |= obj.pop("reference")
+                metrics[p] |= obj
                 if len(pred) != len(test.group):
                     raise AssertionError("test predictions do not cover the test file")
                 predictions_frame(src, rows, p, pred).write_parquet(

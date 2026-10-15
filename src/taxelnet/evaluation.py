@@ -2,10 +2,18 @@
 
 Micro metrics give every real reading equal weight; macro-group metrics give every raw
 (force, Path) condition equal weight (mean over the group's readings first).
+
+Decomposed metrics split the error into pattern, amplitude and offset parts (per map):
+cosine(pred, target); log(||pred|| / ||target||); MAE after least-squares scale + shift
+alignment (MiDaS-style) and after one global least-squares gain; MAE after removing the
+map's median residual; argmax-taxel hit and grid distance; IoU of the contact sets.
+Distribution summaries (`*_median`, `*_iqr`) are over readings; `macro_*_median` is over
+group means.
 """
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import numpy as np
@@ -66,6 +74,100 @@ def global_ssim(pred: np.ndarray, target: np.ndarray, data_range: float) -> np.n
     )
 
 
+CONTACT_THRESHOLD = 50.0  # TC: a taxel above this is "in contact" for contact_iou
+NORM_FLOOR = 1.0  # TC: map norms are floored at this in the amplitude log-ratio
+
+
+def _median_iqr(name: str, per_reading: np.ndarray, group: np.ndarray) -> dict:
+    q25, q50, q75 = np.percentile(per_reading, [25, 50, 75])
+    return {
+        f"{name}_median": float(q50),
+        f"{name}_iqr": float(q75 - q25),
+        f"macro_{name}_median": float(np.median(_group_mean(per_reading, group))),
+    }
+
+
+def decomposed_metrics(
+    pred: np.ndarray,
+    target: np.ndarray,
+    group: np.ndarray,
+    contact_threshold: float = CONTACT_THRESHOLD,
+) -> dict:
+    """Pattern / amplitude / offset decomposition of the error, raw TC, per reading."""
+    n = len(pred)
+    p = pred.astype(np.float64).reshape(n, -1)
+    t = target.astype(np.float64).reshape(n, -1)
+    m: dict[str, Any] = {}
+
+    pn, tn = np.linalg.norm(p, axis=1), np.linalg.norm(t, axis=1)
+    cosine = (p * t).sum(1) / np.maximum(pn * tn, 1e-12)
+    m |= _median_iqr("cosine", cosine, group)
+    logratio = np.log(np.maximum(pn, NORM_FLOOR) / np.maximum(tn, NORM_FLOOR))
+    m |= _median_iqr("amp_logratio", logratio, group)
+
+    # per-map least-squares scale + shift of pred onto target
+    pc, tc = p - p.mean(1, keepdims=True), t - t.mean(1, keepdims=True)
+    var = (pc**2).sum(1)
+    scale = np.where(var > 1e-12, (pc * tc).sum(1) / np.maximum(var, 1e-12), 0.0)
+    aligned = scale[:, None] * pc + t.mean(1, keepdims=True)
+    m |= _micro_macro("aligned_mae", np.abs(aligned - t).mean(1), group)
+
+    # one least-squares gain (no shift) for the whole partition
+    pp = (p**2).sum()
+    gain = float((p * t).sum() / pp) if pp > 0 else 0.0
+    m["gain_aligned_gain"] = gain
+    m |= _micro_macro("gain_aligned_mae", np.abs(gain * p - t).mean(1), group)
+
+    r = p - t
+    r_off = r - np.median(r, axis=1, keepdims=True)
+    m |= _micro_macro("offset_removed_mae", np.abs(r_off).mean(1), group)
+
+    width = target.shape[-1]
+    ap, at = p.argmax(1), t.argmax(1)
+    m |= _micro_macro("peak_hit", (ap == at).astype(np.float64), group)
+    dist = np.hypot(ap // width - at // width, ap % width - at % width)
+    m |= _micro_macro("peak_dist", dist.astype(np.float64), group)
+
+    cp, ct = p > contact_threshold, t > contact_threshold
+    union = (cp | ct).sum(1)
+    iou = np.where(union > 0, (cp & ct).sum(1) / np.maximum(union, 1), 1.0)
+    m |= _micro_macro("contact_iou", iou, group)
+    return m
+
+
+def object_group(name: str) -> str:
+    """Test object group of a grasp `Name`: tokens 0..2, e.g. Cylinder_TestButtons_235."""
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", "_".join(name.split("_")[:3]))
+
+
+def object_metrics(
+    pred: np.ndarray, target: np.ndarray, group: np.ndarray, names: list[str]
+) -> dict:
+    """Macro MAE per test object group and without the cylinders; zero-predictor refs.
+
+    `names` is the grasp `Name` of every reading. Returns flat float entries
+    `group_<object>_mae`, `nocyl_micro_mae`, `nocyl_macro_mae` and a `reference` dict
+    with the same entries for the all-zero predictor.
+    """
+    n = len(pred)
+    err = np.abs((pred - target).astype(np.float64).reshape(n, -1)).mean(1)
+    zero = np.abs(target.astype(np.float64).reshape(n, -1)).mean(1)
+    objects = np.array([object_group(s) for s in names])
+    out: dict[str, Any] = {}
+    ref: dict[str, Any] = {}
+    for obj in sorted(set(objects)):
+        sel = objects == obj
+        out[f"group_{obj}_mae"] = float(_group_mean(err[sel], group[sel]).mean())
+        ref[f"group_{obj}_mae"] = float(_group_mean(zero[sel], group[sel]).mean())
+    nocyl = ~np.char.startswith(objects.astype(str), "Cylinder")
+    if nocyl.any():
+        for d, e in ((out, err), (ref, zero)):
+            mm = _micro_macro("mae", e[nocyl], group[nocyl])
+            d |= {f"nocyl_{k}": v for k, v in mm.items()}
+    out["reference"] = ref
+    return out
+
+
 def compute_metrics(
     pred: np.ndarray, target: np.ndarray, group: np.ndarray, ssim_data_range: float
 ) -> dict:
@@ -86,6 +188,7 @@ def compute_metrics(
     m |= _micro_macro("energy_score", np.sqrt(sq_r.sum(1)), group)
     m |= _micro_macro("ssim", global_ssim(pred, target, ssim_data_range), group)
     m["ssim_data_range"] = ssim_data_range
+    m |= decomposed_metrics(pred, target, group)
     m["per_taxel_micro_mae"] = abs_r.mean(0).tolist()
     m["per_taxel_micro_rmse"] = np.sqrt(sq_r.mean(0)).tolist()
     m["per_taxel_macro_mae"] = _group_mean(abs_r, group).mean(0).tolist()

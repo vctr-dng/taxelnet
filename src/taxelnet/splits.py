@@ -3,6 +3,12 @@
 A full raw (force, Path) group is indivisible: all its presses go to one partition. Group
 weight is its number of real readings. The test set is not carved from the training data:
 it is the external pair in `DataConfig.test_dir`, identical for every run.
+
+`DataConfig.split_strategy`:
+- "group": (force, Path) groups are allocated independently (val = force interpolation
+  on seen shapes).
+- "shape": whole indenter shapes (the part of `Path` before "/") are held out, so val
+  measures generalization to unseen shapes. No shape crosses partitions.
 """
 
 from __future__ import annotations
@@ -17,11 +23,14 @@ from taxelnet.dataset import PairedData
 
 PARTITIONS = ("train", "val")  # carved from the training pair
 TEST = "test"  # the external test pair
-MANIFEST_VERSION = 2
+MANIFEST_VERSION = 3
 
 
 def allocate_groups(
-    group_sizes: np.ndarray, ratios: dict[str, float], seed: int
+    group_sizes: np.ndarray,
+    ratios: dict[str, float],
+    seed: int,
+    largest_first: bool = True,
 ) -> np.ndarray:
     """Partition name per group, with reading counts as close as possible to `ratios`.
 
@@ -29,6 +38,11 @@ def allocate_groups(
     to the partition with the largest remaining deficit relative to its target reading
     count. The relative deficit spreads large repeated groups over every partition in
     proportion, instead of filling the largest partition with them first.
+
+    `largest_first=False` (for a few large units, e.g. whole shapes) keeps the seeded
+    random order and sends each unit only to partitions it does not overfill (falling
+    back to the least relative overfill when it fits nowhere). Size-sorting there would
+    put the same large unit in val for every seed.
     """
     group_sizes = np.asarray(group_sizes)
     names = list(ratios)
@@ -39,40 +53,71 @@ def allocate_groups(
 
     rng = np.random.default_rng(seed)
     perm = rng.permutation(len(group_sizes))
-    order = perm[np.argsort(-group_sizes[perm], kind="stable")]
+    order = perm[np.argsort(-group_sizes[perm], kind="stable")] if largest_first else perm
 
     out = np.empty(len(group_sizes), dtype=object)
     for g in order:
-        p = int(np.argmax((targets - counts) / targets))
+        deficit = (targets - counts) / targets
+        if not largest_first:
+            after = (targets - counts - group_sizes[g]) / targets
+            # among partitions it fits in: largest deficit; else: least relative overfill
+            deficit = np.where(after >= 0, deficit, -np.inf) if (after >= 0).any() else after
+        p = int(np.argmax(deficit))
         out[g] = names[p]
         counts[p] += group_sizes[g]
     return out
+
+
+SPLIT_STRATEGIES = ("group", "shape")
 
 
 def _key(record: dict) -> tuple[float, str]:
     return (float(record["force"]), record["path"])
 
 
+def shape_of(path: str) -> str:
+    """Indenter shape of a training `Path`: the part before the first "/"."""
+    return path.split("/", 1)[0]
+
+
 @dataclass(frozen=True)
 class Split:
     partition: np.ndarray  # partition name per group
     rows: dict[str, np.ndarray]  # sorted data rows per partition
+    strategy: str = "group"
+    held_out_shapes: tuple[str, ...] = ()  # val shapes ("shape" strategy only)
 
 
 def make_split(paired: PairedData, data_cfg: DataConfig) -> Split:
     """Seeded train/val allocation of the training groups (no test carve-out)."""
     keys = [_key(r) for r in paired.groups]
-    partition = allocate_groups(
-        paired.group_sizes,
-        {"train": 1 - data_cfg.val_ratio, "val": data_cfg.val_ratio},
-        data_cfg.split_seed,
-    )
+    ratios = {"train": 1 - data_cfg.val_ratio, "val": data_cfg.val_ratio}
+    strategy = data_cfg.split_strategy
+    held_out: tuple[str, ...] = ()
+    if strategy == "group":
+        partition = allocate_groups(paired.group_sizes, ratios, data_cfg.split_seed)
+    elif strategy == "shape":
+        shapes = np.array([shape_of(r["path"]) for r in paired.groups])
+        names, inverse = np.unique(shapes, return_inverse=True)
+        shape_sizes = np.bincount(inverse, weights=paired.group_sizes).astype(int)
+        shape_part = allocate_groups(
+            shape_sizes, ratios, data_cfg.split_seed, largest_first=False
+        )
+        partition = shape_part[inverse]
+        held_out = tuple(sorted(names[shape_part == "val"].tolist()))
+        assert set(shapes[partition == "train"]).isdisjoint(
+            shapes[partition == "val"]
+        ), "train and val share shapes"
+    else:
+        raise ValueError(
+            f"unknown split_strategy {strategy!r}, expected one of {SPLIT_STRATEGIES}"
+        )
     key_sets = {p: {k for k, q in zip(keys, partition) if q == p} for p in PARTITIONS}
     assert key_sets["train"].isdisjoint(key_sets["val"]), "train and val share keys"
 
     row_partition = partition[paired.group]
     rows = {p: np.flatnonzero(row_partition == p) for p in PARTITIONS}
-    return Split(partition, rows)
+    return Split(partition, rows, strategy, held_out)
 
 
 def shared_keys(paired: PairedData, test: PairedData) -> list[tuple[float, str]]:
@@ -106,6 +151,10 @@ def split_manifest(
         p: {
             "groups": int((split.partition == p).sum()),
             "readings": int(sizes[split.partition == p].sum()),
+            "shapes": len(
+                {shape_of(r["path"]) for r, q in zip(paired.groups, split.partition)
+                 if q == p}
+            ),
         }
         for p in PARTITIONS
     }
@@ -135,9 +184,10 @@ def split_manifest(
         "seed": data_cfg.split_seed,
         "config": {
             "val_ratio": data_cfg.val_ratio,
-            "split_strategy": "group",
+            "split_strategy": split.strategy,
             "group_weight_alpha": alpha,
         },
+        "held_out_shapes": list(split.held_out_shapes),
         "counts": counts,
         "test": {
             "files": {f.name: checksums[f.name] for f in test.files},
