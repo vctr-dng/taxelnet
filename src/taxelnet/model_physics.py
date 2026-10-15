@@ -190,9 +190,16 @@ class FootprintTaxelPredictor(nn.Module):
         return params
 
 
+RESIDUAL_BACKBONES = ("cnn_v0", "cnn_feat")
+
+
 class FootprintCNNTaxelPredictor(nn.Module):
-    """y = footprint(x) + cnn_v0(x); the CNN residual is kept in `self.residual` so the
-    training loop can penalise it (train.residual_l1_weight)."""
+    """y = footprint(x) + cnn(x); the CNN residual is kept in `self.residual` so the
+    training loop can penalise it (train.residual_l1_weight).
+
+    `residual_backbone` picks the CNN branch: cnn_v0 (default) or cnn_feat
+    (taxelnet.model_features, e.g. CoordConv via input_features="z,coord"). The
+    branch is always a plain linear map; output heads act on the final sum."""
 
     def __init__(
         self,
@@ -203,13 +210,29 @@ class FootprintCNNTaxelPredictor(nn.Module):
         head_activation: str = "linear",
         head_lower: float | None = None,
         head_upper: float | None = None,
+        residual_backbone: str = "cnn_v0",
+        input_features: str = "z",
+        convs_per_block: int = 1,
+        norm: str = "none",
         **kwargs: object,
     ) -> None:
         from taxelnet.model import CNNTaxelPredictor  # lazy: model.py registers us
+        from taxelnet.model_features import FeatureCNN
 
         super().__init__()
+        if residual_backbone not in RESIDUAL_BACKBONES:
+            raise ValueError(
+                f"residual_backbone {residual_backbone!r}: expected {RESIDUAL_BACKBONES}"
+            )
         self.footprint = FootprintTaxelPredictor(taxel_shape, **kwargs)
-        self.cnn = CNNTaxelPredictor(taxel_shape, base_channels, num_down_blocks)
+        if residual_backbone == "cnn_feat":
+            self.cnn = FeatureCNN(
+                taxel_shape, base_channels, num_down_blocks,
+                input_features=input_features, convs_per_block=convs_per_block,
+                norm=norm,
+            )  # fmt: skip
+        else:
+            self.cnn = CNNTaxelPredictor(taxel_shape, base_channels, num_down_blocks)
         # start from the pure physics model
         nn.init.zeros_(self.cnn.head.weight)
         nn.init.zeros_(self.cnn.head.bias)

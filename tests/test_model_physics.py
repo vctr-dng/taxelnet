@@ -38,7 +38,7 @@ def test_footprint_models_shapes_grads_and_roundtrip(tmp_path):
 def test_output_heads_compose_with_physics_models(tmp_path):
     """taxel_affine_head + tanh_bounded act on the final map of every model."""
     x = torch.randn(2, 1, 77, 49).abs() * 0.1
-    for name in ("cnn_v0", "footprint", "footprint_cnn"):
+    for name in ("cnn_v0", "cnn_feat", "footprint", "footprint_cnn"):
         cfg = ModelConfig(
             name=name, taxel_affine_head=True, head_activation="tanh_bounded",
             head_lower=-0.5, head_upper=0.5,
@@ -55,3 +55,27 @@ def test_output_heads_compose_with_physics_models(tmp_path):
         assert torch.allclose(load_model(tmp_path / f"{name}.pt")(x), model.eval()(x))
         default = build_model(ModelConfig(name=name), (7, 4))
         assert not any(k.startswith(("taxel_", "out_act")) for k in default.state_dict())
+
+
+def test_footprint_cnn_with_coordconv_residual(tmp_path):
+    """residual_backbone=cnn_feat: CoordConv CNN branch, zero-init, heads on the sum."""
+    from taxelnet.model_features import FeatureCNN
+
+    x = torch.randn(2, 1, 77, 49).abs() * 0.1
+    cfg = ModelConfig(
+        name="footprint_cnn", residual_backbone="cnn_feat", input_features="z,coord",
+        taxel_affine_head=True,
+    )  # fmt: skip
+    model = build_model(cfg, (7, 4))
+    assert isinstance(model.cnn, FeatureCNN)
+    assert model.cnn.encoder[0][0].in_channels == 3
+    assert not any(k.startswith("cnn.taxel_") for k in model.state_dict())
+    y = model(x)
+    assert y.shape == (2, 7, 4) and model.residual.abs().max() == 0
+    y.sum().backward()
+    with torch.no_grad():
+        model.cnn.head.weight.normal_()
+    save_model(tmp_path / "m.pt", model, cfg, (7, 4))
+    assert torch.allclose(load_model(tmp_path / "m.pt")(x), model.eval()(x))
+    default = build_model(ModelConfig(name="footprint_cnn"), (7, 4))
+    assert type(default.cnn).__name__ == "CNNTaxelPredictor"

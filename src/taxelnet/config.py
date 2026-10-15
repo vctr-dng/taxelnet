@@ -66,6 +66,14 @@ class ModelConfig:
     head_bound_margin: float = 1.1
     head_lower: float | None = None
     head_upper: float | None = None
+    # cnn_feat, and the footprint_cnn residual when residual_backbone="cnn_feat"
+    # (taxelnet.model_features): comma list of z, lap, grad, coord
+    input_features: str = "z"
+    convs_per_block: int = 1
+    norm: str = "none"  # none | group (GroupNorm)
+    # footprint_cnn only: CNN residual branch, cnn_v0 | cnn_feat (uses the three
+    # cnn_feat knobs above)
+    residual_backbone: str = "cnn_v0"
 
 
 @dataclass

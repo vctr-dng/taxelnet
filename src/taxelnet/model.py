@@ -95,12 +95,33 @@ from taxelnet.model_physics import (  # noqa: E402
 MODELS |= {"footprint": FootprintTaxelPredictor, "footprint_cnn": FootprintCNNTaxelPredictor}
 
 
+def _register_extra_models() -> None:
+    from taxelnet.model_features import FeatureCNN
+
+    MODELS["cnn_feat"] = FeatureCNN
+
+
+_register_extra_models()
+
+
 def build_model(model_cfg: ModelConfig, taxel_shape: tuple[int, int]) -> nn.Module:
     """Model registry entry point."""
     if model_cfg.name not in MODELS:
         raise ValueError(
             f"unknown model {model_cfg.name!r}, expected one of {list(MODELS)}"
         )
+    kwargs: dict[str, object] = {}
+    feat_kwargs = dict(
+        input_features=model_cfg.input_features,
+        convs_per_block=model_cfg.convs_per_block,
+        norm=model_cfg.norm,
+    )
+    if model_cfg.name == "cnn_feat":
+        kwargs = feat_kwargs
+    elif model_cfg.name == "footprint_cnn":
+        kwargs = dict(residual_backbone=model_cfg.residual_backbone, **feat_kwargs)
+    elif model_cfg.residual_backbone != "cnn_v0":
+        raise ValueError("model.residual_backbone only applies to footprint_cnn")
     return MODELS[model_cfg.name](
         taxel_shape=tuple(taxel_shape),
         base_channels=model_cfg.base_channels,
@@ -109,4 +130,5 @@ def build_model(model_cfg: ModelConfig, taxel_shape: tuple[int, int]) -> nn.Modu
         head_activation=model_cfg.head_activation,
         head_lower=model_cfg.head_lower,
         head_upper=model_cfg.head_upper,
+        **kwargs,
     )
