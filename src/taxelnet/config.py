@@ -50,6 +50,8 @@ class ModelConfig:
     name: str = "cnn_v0"
     base_channels: int = 16
     num_down_blocks: int = 3
+    # learned per-taxel gain/offset on the output (y_t = g_t * z_t + o_t), init identity
+    taxel_affine_head: bool = False
 
 
 @dataclass
