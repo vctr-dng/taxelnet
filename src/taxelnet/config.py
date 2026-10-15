@@ -78,6 +78,13 @@ class TrainConfig:
     # separate lr for the physics parameters (`model.footprint`) of hybrid models;
     # None = train.lr for every parameter
     physics_lr: float | None = None
+    # ssi experiment: L = L1 + loss_ssi_weight * L_ssi + loss_grad_weight * L_grad, the
+    # MiDaS scale-and-shift-invariant pattern terms (taxelnet.ssi), group-balanced like
+    # L1. 0 = off (default). loss_ssi_eps: MAD floor of the per-map normalization, in
+    # scaled target units.
+    loss_ssi_weight: float = 0.0
+    loss_grad_weight: float = 0.0
+    loss_ssi_eps: float = 0.05
 
 
 @dataclass
