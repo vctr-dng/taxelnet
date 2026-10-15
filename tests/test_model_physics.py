@@ -33,3 +33,25 @@ def test_footprint_models_shapes_grads_and_roundtrip(tmp_path):
         params = model.report(tmp_path)
         assert {"eta", "gamma", "sigma_rows"} <= set(params)
         assert (tmp_path / "footprint_weights.png").exists()
+
+
+def test_output_heads_compose_with_physics_models(tmp_path):
+    """taxel_affine_head + tanh_bounded act on the final map of every model."""
+    x = torch.randn(2, 1, 77, 49).abs() * 0.1
+    for name in ("cnn_v0", "footprint", "footprint_cnn"):
+        cfg = ModelConfig(
+            name=name, taxel_affine_head=True, head_activation="tanh_bounded",
+            head_lower=-0.5, head_upper=0.5,
+        )  # fmt: skip
+        model = build_model(cfg, (7, 4))
+        keys = set(model.state_dict())
+        assert {"taxel_gain", "taxel_offset", "out_act.lo", "out_act.hi"} <= keys
+        with torch.no_grad():
+            model.taxel_gain.fill_(100.0)
+        y = model(x)
+        assert y.shape == (2, 7, 4)
+        assert (y.abs() <= 0.5).all()  # float32 tanh saturates to exactly 1
+        save_model(tmp_path / f"{name}.pt", model, cfg, (7, 4))
+        assert torch.allclose(load_model(tmp_path / f"{name}.pt")(x), model.eval()(x))
+        default = build_model(ModelConfig(name=name), (7, 4))
+        assert not any(k.startswith(("taxel_", "out_act")) for k in default.state_dict())
