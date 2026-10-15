@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 from taxelnet.config import ModelConfig
+from taxelnet.heads import apply_output_head, init_output_head
 
 
 class CNNTaxelPredictor(nn.Module):
@@ -31,6 +32,9 @@ class CNNTaxelPredictor(nn.Module):
         base_channels: int = 16,
         num_down_blocks: int = 3,
         taxel_affine_head: bool = False,
+        head_activation: str = "linear",
+        head_lower: float | None = None,
+        head_upper: float | None = None,
     ) -> None:
         super().__init__()
         self.taxel_shape = taxel_shape
@@ -66,21 +70,18 @@ class CNNTaxelPredictor(nn.Module):
         #   per taxel, but gradients are rebalanced (loud taxels compressed). The inverse
         #   clamps y' to the train range so sinh cannot explode (taxelnet.amp).
         self.head = nn.Conv2d(in_channels, 1, kernel_size=1)
-        # optional learned per-taxel gain and offset after the shared head (plan C1):
-        # y_t = g_t * head_t + o_t, initialized to the identity
-        self.taxel_affine_head = taxel_affine_head
-        if taxel_affine_head:
-            self.taxel_gain = nn.Parameter(torch.ones(taxel_shape))
-            self.taxel_offset = nn.Parameter(torch.zeros(taxel_shape))
+        # optional output heads (taxelnet.heads): learned per-taxel gain/offset
+        # (plan C1, init identity) then the bounded tanh soft clip (experiment `sat`)
+        init_output_head(
+            self, taxel_shape, taxel_affine_head, head_activation, head_lower, head_upper
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, 1, H_mesh, W_mesh) -> returns (B, H_taxel, W_taxel)."""
         features = self.encoder(x)
         resized = self.resize(features)
         out = self.head(resized).squeeze(1)
-        if self.taxel_affine_head:
-            out = out * self.taxel_gain + self.taxel_offset
-        return out
+        return apply_output_head(self, out)
 
 
 MODELS = {"cnn_v0": CNNTaxelPredictor}
@@ -105,4 +106,7 @@ def build_model(model_cfg: ModelConfig, taxel_shape: tuple[int, int]) -> nn.Modu
         base_channels=model_cfg.base_channels,
         num_down_blocks=model_cfg.num_down_blocks,
         taxel_affine_head=model_cfg.taxel_affine_head,
+        head_activation=model_cfg.head_activation,
+        head_lower=model_cfg.head_lower,
+        head_upper=model_cfg.head_upper,
     )

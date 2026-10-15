@@ -16,6 +16,7 @@ import torch
 
 from taxelnet import amp
 from taxelnet.config import PreprocessingConfig
+from taxelnet.saturation import asinh_compress
 from taxelnet.io_csv import (
     SIM_GRID_SHAPE,
     TAXEL_GRID_SHAPE,
@@ -25,7 +26,7 @@ from taxelnet.io_csv import (
     Y_MIN,
 )
 
-INPUT_SCALERS = ("identity", "max_abs", "zscore", "robust_zscore")
+INPUT_SCALERS = ("identity", "max_abs", "zscore", "robust_zscore", "asinh")
 TARGET_SCALERS = ("identity", "global_scale", "per_taxel_zscore", "asinh")
 
 Array = TypeVar("Array", np.ndarray, torch.Tensor)
@@ -101,6 +102,10 @@ class Preprocessor:
             case "robust_zscore":
                 q25, med, q75 = np.percentile(x, [25, 50, 75])
                 pre.x_center, pre.x_scale = float(med), float(q75 - q25)
+            case "asinh":
+                # x' = asinh(x / s) / asinh(max|x| / s): train max maps to 1
+                s = config.input_asinh_scale
+                pre.x_scale = float(asinh_compress(np.abs(x).max(), s))
         if not pre.x_scale > 0:
             raise ValueError(f"degenerate input scale {pre.x_scale}")
 
@@ -132,7 +137,10 @@ class Preprocessor:
         return value.astype(ref.dtype)
 
     def transform_x(self, x: Array) -> Array:
-        return (self._clip(x) - self.x_center) / self.x_scale
+        x = self._clip(x)
+        if self.config.input_scaler == "asinh":
+            x = asinh_compress(x, self.config.input_asinh_scale)
+        return (x - self.x_center) / self.x_scale
 
     def transform_y(self, y: Array) -> Array:
         if self.config.target_scaler == "asinh":
@@ -164,7 +172,12 @@ class Preprocessor:
                 "y_clamp_hi": self.y_clamp_hi,
             },
             "formulas": {
-                "input": "x_scaled = (clip(x_mm) - x_center) / x_scale",
+                "input": (
+                    "x_scaled = (asinh(clip(x_mm) / input_asinh_scale) - x_center) "
+                    "/ x_scale"
+                    if self.config.input_scaler == "asinh"
+                    else "x_scaled = (clip(x_mm) - x_center) / x_scale"
+                ),
                 "target": "y_scaled = (y_tc - y_center) / y_scale",
                 "inverse": "y_tc = y_scaled * y_scale + y_center",
                 "asinh_target": "y_scaled = asinh(y_tc / asinh_scale)",

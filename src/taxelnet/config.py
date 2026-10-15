@@ -38,7 +38,7 @@ class DataConfig:
 @dataclass
 class PreprocessingConfig:
     # one global scalar for the whole grid: keeps the convolutions translation-equivariant
-    input_scaler: str = "max_abs"  # identity | max_abs | zscore | robust_zscore
+    input_scaler: str = "max_abs"  # identity | max_abs | zscore | robust_zscore | asinh
     # see the head comment in taxelnet.model for the trade-offs between these three
     # identity | global_scale | per_taxel_zscore | asinh
     target_scaler: str = "global_scale"
@@ -48,6 +48,8 @@ class PreprocessingConfig:
     # train range of y' widened by asinh_clamp_margin (asinh units) on each side
     asinh_scale: float = 100.0
     asinh_clamp_margin: float = 0.25
+    # asinh only: x' = asinh(x / s) / asinh(max|x_train| / s), s in mm (taxelnet.saturation)
+    input_asinh_scale: float = 0.2
 
 
 @dataclass
@@ -57,6 +59,13 @@ class ModelConfig:
     num_down_blocks: int = 3
     # learned per-taxel gain/offset on the output (y_t = g_t * z_t + o_t), init identity
     taxel_affine_head: bool = False
+    # linear | tanh_bounded: soft clip of the scaled output to (lo, hi) (taxelnet.saturation)
+    head_activation: str = "linear"
+    # tanh_bounded: bounds = margin * (min, max) of the scaled train targets, filled in
+    # at fit time unless given explicitly (scaled target units, not TC)
+    head_bound_margin: float = 1.1
+    head_lower: float | None = None
+    head_upper: float | None = None
 
 
 @dataclass

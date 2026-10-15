@@ -25,6 +25,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from taxelnet.heads import apply_output_head, init_output_head
 from taxelnet.io_csv import SIM_GRID_SHAPE
 
 EPS = 1e-4  # in scaled input units (max_abs: max train |x| = 1)
@@ -46,6 +47,10 @@ class FootprintTaxelPredictor(nn.Module):
         eta_init: float = 0.7,
         gamma_init: float = 0.5,
         gain_init: float = 8.0,
+        taxel_affine_head: bool = False,
+        head_activation: str = "linear",
+        head_lower: float | None = None,
+        head_upper: float | None = None,
         **_: object,  # base_channels / num_down_blocks from ModelConfig: unused
     ) -> None:
         super().__init__()
@@ -78,6 +83,11 @@ class FootprintTaxelPredictor(nn.Module):
         self.log_gain = nn.Parameter(torch.full((n_taxels,), math.log(gain_init)))
         self.bulge_gain = nn.Parameter(torch.zeros(n_taxels))
         self.offset = nn.Parameter(torch.zeros(n_taxels))
+        # optional output heads on the final map (taxelnet.heads)
+        init_output_head(
+            self, self.taxel_shape, taxel_affine_head, head_activation,
+            head_lower, head_upper,
+        )  # fmt: skip
 
     # -- physical parameters ------------------------------------------------------
     @property
@@ -120,7 +130,7 @@ class FootprintTaxelPredictor(nn.Module):
         r = pooled ** (gamma / eta)
         bulge = torch.einsum("bhw,thw->bt", (-x).clamp(min=0)[:, 0], w)
         y = self.log_gain.exp() * r + self.bulge_gain * bulge + self.offset
-        return y.view(-1, *self.taxel_shape)
+        return apply_output_head(self, y.view(-1, *self.taxel_shape))
 
     # -- reporting ----------------------------------------------------------------
     @torch.no_grad()
@@ -189,6 +199,10 @@ class FootprintCNNTaxelPredictor(nn.Module):
         taxel_shape: tuple[int, int],
         base_channels: int = 16,
         num_down_blocks: int = 3,
+        taxel_affine_head: bool = False,
+        head_activation: str = "linear",
+        head_lower: float | None = None,
+        head_upper: float | None = None,
         **kwargs: object,
     ) -> None:
         from taxelnet.model import CNNTaxelPredictor  # lazy: model.py registers us
@@ -200,10 +214,16 @@ class FootprintCNNTaxelPredictor(nn.Module):
         nn.init.zeros_(self.cnn.head.weight)
         nn.init.zeros_(self.cnn.head.bias)
         self.residual: torch.Tensor | None = None
+        # optional output heads on the sum footprint + residual (taxelnet.heads); the
+        # two submodules keep plain linear outputs
+        init_output_head(
+            self, tuple(taxel_shape), taxel_affine_head, head_activation,
+            head_lower, head_upper,
+        )  # fmt: skip
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         self.residual = self.cnn(x)
-        return self.footprint(x) + self.residual
+        return apply_output_head(self, self.footprint(x) + self.residual)
 
     def report(self, out_dir: Path) -> dict[str, float]:
         return self.footprint.report(out_dir)
