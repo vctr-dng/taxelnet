@@ -47,6 +47,7 @@ from taxelnet.io_csv import file_sha256
 from taxelnet.model import build_model
 from taxelnet.plots import save_inference_plots, select_plot_samples
 from taxelnet.preprocessing import Preprocessor
+from taxelnet.ssi import ssi_losses
 from taxelnet.splits import PARTITIONS, TEST, make_split, shared_keys, split_manifest
 
 Logger = Callable[[dict[str, float], int], object]
@@ -89,23 +90,39 @@ def train_one_epoch(
     sampler: GroupBatchSampler,
     optimizer: Optimizer,
     alpha: float = 0.0,
-) -> float:
-    """Group-balanced loss (scaled target space), averaged over the epoch's groups."""
+    ssi_weight: float = 0.0,
+    grad_weight: float = 0.0,
+    ssi_eps: float = 0.05,
+) -> dict[str, float]:
+    """Group-balanced loss (scaled target space), averaged over the epoch's groups.
+
+    Returns the epoch mean of each term: l1, ssi and grad (when enabled), and total.
+    """
     model.train()
-    total, n_groups = 0.0, 0
+    totals: dict[str, float] = {}
+    n_groups = 0
     for batch in sampler:
         idx = torch.as_tensor(batch, device=ds.x.device)
         x, y, group = ds.__getitems__(idx)
-        loss = group_balanced_l1(model(x), y, group, alpha)
+        pred = model(x)
+        terms = {"l1": group_balanced_l1(pred, y, group, alpha)}
+        loss = terms["l1"]
+        if ssi_weight > 0 or grad_weight > 0:
+            l_ssi, l_grad = ssi_losses(pred, y, ssi_eps)
+            terms["ssi"] = group_mean(l_ssi, group, alpha)
+            terms["grad"] = group_mean(l_grad, group, alpha)
+            loss = loss + ssi_weight * terms["ssi"] + grad_weight * terms["grad"]
+        terms["total"] = loss
         if not torch.isfinite(loss):
             raise FloatingPointError(f"non-finite training loss {loss.item()}")
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
         k = len(torch.unique(group))
-        total += loss.item() * k
+        for name, v in terms.items():
+            totals[name] = totals.get(name, 0.0) + v.item() * k
         n_groups += k
-    return total / n_groups
+    return {name: v / n_groups for name, v in totals.items()}
 
 
 @torch.no_grad()
@@ -161,7 +178,11 @@ def fit(
 
     for epoch in range(1, train_cfg.epochs + 1):
         lr = optimizer.param_groups[0]["lr"]
-        train_one_epoch(model, train_ds, sampler, optimizer, alpha)
+        epoch_terms = train_one_epoch(
+            model, train_ds, sampler, optimizer, alpha,
+            train_cfg.loss_ssi_weight, train_cfg.loss_grad_weight,
+            train_cfg.loss_ssi_eps,
+        )  # fmt: skip
         if scheduler is not None:
             scheduler.step()
         train_m = evaluate_loss(model, train_ds, pre, alpha)
@@ -183,6 +204,8 @@ def fit(
             logger(
                 {
                     **{f"train_{k}": v for k, v in train_m.items()},
+                    # running epoch means of the optimized terms (train_l1, ...)
+                    **{f"train_{k}": v for k, v in epoch_terms.items()},
                     **{f"val_{k}": v for k, v in val_m.items()},
                     "lr": lr,
                     "best_val_macro_mae": history.best_val_macro_mae,

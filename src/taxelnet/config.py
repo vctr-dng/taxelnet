@@ -70,6 +70,13 @@ class TrainConfig:
     # metrics of that model, and inference plots. 0 disables. Monitoring only: best.pt is
     # always selected on validation, never on test.
     test_every: int = 10
+    # ssi experiment: L = L1 + loss_ssi_weight * L_ssi + loss_grad_weight * L_grad, the
+    # MiDaS scale-and-shift-invariant pattern terms (taxelnet.ssi), group-balanced like
+    # L1. 0 = off (default). loss_ssi_eps: MAD floor of the per-map normalization, in
+    # scaled target units.
+    loss_ssi_weight: float = 0.0
+    loss_grad_weight: float = 0.0
+    loss_ssi_eps: float = 0.05
 
 
 @dataclass
