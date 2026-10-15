@@ -21,7 +21,7 @@ import torch
 from torch import nn
 from torch.optim import Optimizer
 
-from taxelnet import artifacts
+from taxelnet import amp, artifacts
 from taxelnet.checkpoint import (
     ARTIFACT_CONTRACT_VERSION,
     load_checkpoint,
@@ -89,14 +89,27 @@ def train_one_epoch(
     sampler: GroupBatchSampler,
     optimizer: Optimizer,
     alpha: float = 0.0,
+    pre: Preprocessor | None = None,
+    logamp_weight: float = 0.0,
+    logamp_eps: float = 50.0,
 ) -> float:
-    """Group-balanced loss (scaled target space), averaged over the epoch's groups."""
+    """Group-balanced loss (scaled target space), averaged over the epoch's groups.
+
+    With logamp_weight > 0, adds the group-balanced log-amplitude term computed in raw
+    TC (`taxelnet.amp.logamp_per_press`, needs `pre`)."""
     model.train()
     total, n_groups = 0.0, 0
     for batch in sampler:
         idx = torch.as_tensor(batch, device=ds.x.device)
         x, y, group = ds.__getitems__(idx)
-        loss = group_balanced_l1(model(x), y, group, alpha)
+        pred = model(x)
+        loss = group_balanced_l1(pred, y, group, alpha)
+        if logamp_weight > 0:
+            assert pre is not None
+            per_press = amp.logamp_per_press(
+                pre.inverse_y(pred, clamp=False), pre.inverse_y(y), logamp_eps
+            )
+            loss = loss + logamp_weight * group_mean(per_press, group, alpha)
         if not torch.isfinite(loss):
             raise FloatingPointError(f"non-finite training loss {loss.item()}")
         optimizer.zero_grad(set_to_none=True)
@@ -161,7 +174,10 @@ def fit(
 
     for epoch in range(1, train_cfg.epochs + 1):
         lr = optimizer.param_groups[0]["lr"]
-        train_one_epoch(model, train_ds, sampler, optimizer, alpha)
+        train_one_epoch(
+            model, train_ds, sampler, optimizer, alpha, pre,
+            train_cfg.loss_logamp_weight, train_cfg.loss_logamp_eps,
+        )  # fmt: skip
         if scheduler is not None:
             scheduler.step()
         train_m = evaluate_loss(model, train_ds, pre, alpha)
@@ -293,7 +309,8 @@ def run_training(cfgs: Configs) -> RunResult:
                 "model.n_params": n_params,
                 "model.architecture": repr(model).replace("\n", " "),
                 "train.optimizer": "AdamW",
-                "train.loss": "group_balanced_l1",
+                "train.loss": "group_balanced_l1"
+                + ("+logamp" if cfgs.train.loss_logamp_weight > 0 else ""),
                 "train.device_name": (
                     torch.cuda.get_device_name(device)
                     if device.startswith("cuda")

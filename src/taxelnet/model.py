@@ -61,6 +61,9 @@ class CNNTaxelPredictor(nn.Module):
         # - per_taxel_zscore: per-taxel standardization. L1 then equals raw L1 weighted
         #   by 1 / sigma_t, so quiet taxels are up-weighted: a different estimand
         #   weighting, to be chosen deliberately.
+        # - asinh: y' = asinh(y / s), monotone, so L1 still estimates the raw-TC median
+        #   per taxel, but gradients are rebalanced (loud taxels compressed). The inverse
+        #   clamps y' to the train range so sinh cannot explode (taxelnet.amp).
         self.head = nn.Conv2d(in_channels, 1, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
