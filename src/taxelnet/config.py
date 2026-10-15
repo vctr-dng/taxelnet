@@ -38,11 +38,13 @@ class DataConfig:
 @dataclass
 class PreprocessingConfig:
     # one global scalar for the whole grid: keeps the convolutions translation-equivariant
-    input_scaler: str = "max_abs"  # identity | max_abs | zscore | robust_zscore
+    input_scaler: str = "max_abs"  # identity | max_abs | zscore | robust_zscore | asinh
     # see the head comment in taxelnet.model for the trade-offs between these three
     target_scaler: str = "global_scale"  # identity | global_scale | per_taxel_zscore
     # optional [min, max] in mm; never clip at 0 by default (negatives are pad bulge)
     clip_input: tuple[float, float] | None = None
+    # asinh only: x' = asinh(x / s) / asinh(max|x_train| / s), s in mm (taxelnet.saturation)
+    input_asinh_scale: float = 0.2
 
 
 @dataclass
@@ -50,6 +52,13 @@ class ModelConfig:
     name: str = "cnn_v0"
     base_channels: int = 16
     num_down_blocks: int = 3
+    # linear | tanh_bounded: soft clip of the scaled output to (lo, hi) (taxelnet.saturation)
+    head_activation: str = "linear"
+    # tanh_bounded: bounds = margin * (min, max) of the scaled train targets, filled in
+    # at fit time unless given explicitly (scaled target units, not TC)
+    head_bound_margin: float = 1.1
+    head_lower: float | None = None
+    head_upper: float | None = None
 
 
 @dataclass

@@ -47,6 +47,7 @@ from taxelnet.io_csv import file_sha256
 from taxelnet.model import build_model
 from taxelnet.plots import save_inference_plots, select_plot_samples
 from taxelnet.preprocessing import Preprocessor
+from taxelnet.saturation import head_bounds
 from taxelnet.splits import PARTITIONS, TEST, make_split, shared_keys, split_manifest
 
 Logger = Callable[[dict[str, float], int], object]
@@ -259,6 +260,14 @@ def run_training(cfgs: Configs) -> RunResult:
     for p, (src, rows) in sources.items():
         print(f"{p}: {len(ds[p])} readings, {len(np.unique(src.group[rows]))} groups")
 
+    if cfgs.model.head_activation == "tanh_bounded":
+        lo, hi = head_bounds(
+            pre.transform_y(paired.y[train_rows]), cfgs.model.head_bound_margin
+        )
+        if cfgs.model.head_lower is None:
+            cfgs.model.head_lower = lo
+        if cfgs.model.head_upper is None:
+            cfgs.model.head_upper = hi
     model = build_model(cfgs.model, paired.taxel_shape).to(device)
     out = model(ds["train"].x[:1])
     if tuple(out.shape[1:]) != paired.taxel_shape:

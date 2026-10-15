@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 from taxelnet.config import ModelConfig
+from taxelnet.saturation import HEAD_ACTIVATIONS, BoundedTanh
 
 
 class CNNTaxelPredictor(nn.Module):
@@ -30,6 +31,9 @@ class CNNTaxelPredictor(nn.Module):
         taxel_shape: tuple[int, int],
         base_channels: int = 16,
         num_down_blocks: int = 3,
+        head_activation: str = "linear",
+        head_lower: float | None = None,
+        head_upper: float | None = None,
     ) -> None:
         super().__init__()
         self.taxel_shape = taxel_shape
@@ -62,12 +66,23 @@ class CNNTaxelPredictor(nn.Module):
         #   by 1 / sigma_t, so quiet taxels are up-weighted: a different estimand
         #   weighting, to be chosen deliberately.
         self.head = nn.Conv2d(in_channels, 1, kernel_size=1)
+        if head_activation not in HEAD_ACTIVATIONS:
+            raise ValueError(f"head_activation must be one of {HEAD_ACTIVATIONS}")
+        # optional saturating output (experiment `sat`); absent for "linear" so the
+        # default state_dict is unchanged
+        if head_activation == "tanh_bounded":
+            self.out_act = BoundedTanh(
+                -1.0 if head_lower is None else head_lower,
+                1.0 if head_upper is None else head_upper,
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, 1, H_mesh, W_mesh) -> returns (B, H_taxel, W_taxel)."""
         features = self.encoder(x)
         resized = self.resize(features)
         out = self.head(resized)
+        if hasattr(self, "out_act"):
+            out = self.out_act(out)
         return out.squeeze(1)
 
 
@@ -84,4 +99,7 @@ def build_model(model_cfg: ModelConfig, taxel_shape: tuple[int, int]) -> nn.Modu
         taxel_shape=tuple(taxel_shape),
         base_channels=model_cfg.base_channels,
         num_down_blocks=model_cfg.num_down_blocks,
+        head_activation=model_cfg.head_activation,
+        head_lower=model_cfg.head_lower,
+        head_upper=model_cfg.head_upper,
     )
