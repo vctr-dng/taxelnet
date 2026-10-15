@@ -273,9 +273,15 @@ def run_training(cfgs: Configs) -> RunResult:
 
     mlflow.set_tracking_uri(cfgs.tracking.resolved_uri())
     if mlflow.get_experiment_by_name(cfgs.tracking.experiment) is None:
-        mlflow.create_experiment(
-            cfgs.tracking.experiment, artifact_location=cfgs.tracking.artifact_location
-        )
+        try:
+            mlflow.create_experiment(
+                cfgs.tracking.experiment,
+                artifact_location=cfgs.tracking.artifact_location,
+            )
+        except mlflow.exceptions.MlflowException:
+            # a concurrent run created it first
+            if mlflow.get_experiment_by_name(cfgs.tracking.experiment) is None:
+                raise
     mlflow.set_experiment(cfgs.tracking.experiment)
 
     with mlflow.start_run(run_name=run_name) as run:
