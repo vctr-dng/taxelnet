@@ -50,6 +50,10 @@ class ModelConfig:
     name: str = "cnn_v0"
     base_channels: int = 16
     num_down_blocks: int = 3
+    # cnn_feat only (taxelnet.model_features): comma list of z, lap, grad, coord
+    input_features: str = "z"
+    convs_per_block: int = 1
+    norm: str = "none"  # none | group (GroupNorm)
 
 
 @dataclass

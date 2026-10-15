@@ -74,14 +74,31 @@ class CNNTaxelPredictor(nn.Module):
 MODELS = {"cnn_v0": CNNTaxelPredictor}
 
 
+def _register_extra_models() -> None:
+    from taxelnet.model_features import FeatureCNN
+
+    MODELS["cnn_feat"] = FeatureCNN
+
+
+_register_extra_models()
+
+
 def build_model(model_cfg: ModelConfig, taxel_shape: tuple[int, int]) -> nn.Module:
     """Model registry entry point."""
     if model_cfg.name not in MODELS:
         raise ValueError(
             f"unknown model {model_cfg.name!r}, expected one of {list(MODELS)}"
         )
+    kwargs = {}
+    if model_cfg.name == "cnn_feat":
+        kwargs = dict(
+            input_features=model_cfg.input_features,
+            convs_per_block=model_cfg.convs_per_block,
+            norm=model_cfg.norm,
+        )
     return MODELS[model_cfg.name](
         taxel_shape=tuple(taxel_shape),
         base_channels=model_cfg.base_channels,
         num_down_blocks=model_cfg.num_down_blocks,
+        **kwargs,
     )
