@@ -14,6 +14,7 @@ from typing import Any, TypeVar
 import numpy as np
 import torch
 
+from taxelnet import amp
 from taxelnet.config import PreprocessingConfig
 from taxelnet.io_csv import (
     SIM_GRID_SHAPE,
@@ -25,7 +26,7 @@ from taxelnet.io_csv import (
 )
 
 INPUT_SCALERS = ("identity", "max_abs", "zscore", "robust_zscore")
-TARGET_SCALERS = ("identity", "global_scale", "per_taxel_zscore")
+TARGET_SCALERS = ("identity", "global_scale", "per_taxel_zscore", "asinh")
 
 Array = TypeVar("Array", np.ndarray, torch.Tensor)
 
@@ -74,6 +75,9 @@ class Preprocessor:
     # target: y' = (y - y_center) / y_scale, scalars or (H, W) per-taxel arrays
     y_center: np.ndarray = field(default_factory=lambda: np.zeros(()))
     y_scale: np.ndarray = field(default_factory=lambda: np.ones(()))
+    # asinh only: y' = asinh(y / asinh_scale); inverse clamps y' to these train bounds
+    y_clamp_lo: float | None = None
+    y_clamp_hi: float | None = None
     fitted_on: str | None = None
     n_fit_rows: int = 0
 
@@ -106,6 +110,12 @@ class Preprocessor:
                 pre.y_scale = np.array(y.std())
             case "per_taxel_zscore":
                 pre.y_center, pre.y_scale = y.mean(axis=0), y.std(axis=0)
+            case "asinh":
+                if not config.asinh_scale > 0:
+                    raise ValueError(f"asinh_scale must be > 0, got {config.asinh_scale}")
+                pre.y_clamp_lo, pre.y_clamp_hi = amp.asinh_clamp_bounds(
+                    y, config.asinh_scale, config.asinh_clamp_margin
+                )
         if not (pre.y_scale > 0).all():
             raise ValueError("degenerate target scale")
         return pre
@@ -125,9 +135,14 @@ class Preprocessor:
         return (self._clip(x) - self.x_center) / self.x_scale
 
     def transform_y(self, y: Array) -> Array:
+        if self.config.target_scaler == "asinh":
+            return amp.asinh_forward(y, self.config.asinh_scale)
         return (y - self._like(self.y_center, y)) / self._like(self.y_scale, y)
 
-    def inverse_y(self, y: Array) -> Array:
+    def inverse_y(self, y: Array, clamp: bool = True) -> Array:
+        if self.config.target_scaler == "asinh":
+            lo, hi = (self.y_clamp_lo, self.y_clamp_hi) if clamp else (None, None)
+            return amp.asinh_inverse(y, self.config.asinh_scale, lo, hi)
         return y * self._like(self.y_scale, y) + self._like(self.y_center, y)
 
     def to_dict(self) -> dict[str, Any]:
@@ -145,11 +160,17 @@ class Preprocessor:
                 "x_scale": self.x_scale,
                 "y_center": np.asarray(self.y_center).tolist(),
                 "y_scale": np.asarray(self.y_scale).tolist(),
+                "y_clamp_lo": self.y_clamp_lo,
+                "y_clamp_hi": self.y_clamp_hi,
             },
             "formulas": {
                 "input": "x_scaled = (clip(x_mm) - x_center) / x_scale",
                 "target": "y_scaled = (y_tc - y_center) / y_scale",
                 "inverse": "y_tc = y_scaled * y_scale + y_center",
+                "asinh_target": "y_scaled = asinh(y_tc / asinh_scale)",
+                "asinh_inverse": (
+                    "y_tc = asinh_scale * sinh(clip(y_scaled, y_clamp_lo, y_clamp_hi))"
+                ),
             },
             "contract": tensor_contract(),
         }
@@ -170,6 +191,8 @@ class Preprocessor:
             x_scale=fitted["x_scale"],
             y_center=np.asarray(fitted["y_center"]),
             y_scale=np.asarray(fitted["y_scale"]),
+            y_clamp_lo=fitted.get("y_clamp_lo"),
+            y_clamp_hi=fitted.get("y_clamp_hi"),
             fitted_on=fitted["fitted_on"],
             n_fit_rows=fitted["n_fit_rows"],
         )

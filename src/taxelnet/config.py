@@ -40,9 +40,14 @@ class PreprocessingConfig:
     # one global scalar for the whole grid: keeps the convolutions translation-equivariant
     input_scaler: str = "max_abs"  # identity | max_abs | zscore | robust_zscore
     # see the head comment in taxelnet.model for the trade-offs between these three
-    target_scaler: str = "global_scale"  # identity | global_scale | per_taxel_zscore
+    # identity | global_scale | per_taxel_zscore | asinh
+    target_scaler: str = "global_scale"
     # optional [min, max] in mm; never clip at 0 by default (negatives are pad bulge)
     clip_input: tuple[float, float] | None = None
+    # asinh target only: y' = asinh(y_tc / asinh_scale); the inverse clamps y' to the
+    # train range of y' widened by asinh_clamp_margin (asinh units) on each side
+    asinh_scale: float = 100.0
+    asinh_clamp_margin: float = 0.25
 
 
 @dataclass
@@ -63,6 +68,10 @@ class TrainConfig:
     scheduler: str = "cosine"  # cosine | none
     # group weight n_g ** alpha: 0 = group-balanced (default), 1 = micro (ablation only)
     group_weight_alpha: float = 0.0
+    # auxiliary |log(||y_hat||+eps) - log(||y||+eps)| per reading (norm over taxels, raw
+    # TC), group-balanced like L1 and added with this weight; 0 = off (taxelnet.amp)
+    loss_logamp_weight: float = 0.0
+    loss_logamp_eps: float = 50.0  # TC
     device: str = field(
         default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu"
     )

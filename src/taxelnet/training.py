@@ -21,7 +21,7 @@ import torch
 from torch import nn
 from torch.optim import Optimizer
 
-from taxelnet import artifacts
+from taxelnet import amp, artifacts
 from taxelnet.checkpoint import (
     ARTIFACT_CONTRACT_VERSION,
     load_checkpoint,
@@ -90,17 +90,21 @@ def train_one_epoch(
     sampler: GroupBatchSampler,
     optimizer: Optimizer,
     alpha: float = 0.0,
+    pre: Preprocessor | None = None,
     *,
     residual_l1_weight: float = 0.0,
     ssi_weight: float = 0.0,
     grad_weight: float = 0.0,
     ssi_eps: float = 0.05,
+    logamp_weight: float = 0.0,
+    logamp_eps: float = 50.0,
 ) -> dict[str, float]:
     """Group-balanced loss (scaled target space), averaged over the epoch's groups.
 
     Optional terms: `residual_l1_weight` times the mean |model.residual| (hybrid models
-    only); the ssi / grad pattern terms (taxelnet.ssi). Returns the epoch mean of each
-    term: l1, residual / ssi / grad (when enabled), and total.
+    only); the ssi / grad pattern terms (taxelnet.ssi); the group-balanced log-amplitude
+    term computed in raw TC (`taxelnet.amp.logamp_per_press`, needs `pre`). Returns the
+    epoch mean of each term: l1, residual / ssi / grad / logamp (when enabled), total.
     """
     model.train()
     totals: dict[str, float] = {}
@@ -119,6 +123,13 @@ def train_one_epoch(
             terms["ssi"] = group_mean(l_ssi, group, alpha)
             terms["grad"] = group_mean(l_grad, group, alpha)
             loss = loss + ssi_weight * terms["ssi"] + grad_weight * terms["grad"]
+        if logamp_weight > 0:
+            assert pre is not None
+            per_press = amp.logamp_per_press(
+                pre.inverse_y(pred, clamp=False), pre.inverse_y(y), logamp_eps
+            )
+            terms["logamp"] = group_mean(per_press, group, alpha)
+            loss = loss + logamp_weight * terms["logamp"]
         terms["total"] = loss
         if not torch.isfinite(loss):
             raise FloatingPointError(f"non-finite training loss {loss.item()}")
@@ -193,11 +204,13 @@ def fit(
     for epoch in range(1, train_cfg.epochs + 1):
         lr = optimizer.param_groups[0]["lr"]
         epoch_terms = train_one_epoch(
-            model, train_ds, sampler, optimizer, alpha,
+            model, train_ds, sampler, optimizer, alpha, pre,
             residual_l1_weight=train_cfg.residual_l1_weight,
             ssi_weight=train_cfg.loss_ssi_weight,
             grad_weight=train_cfg.loss_grad_weight,
             ssi_eps=train_cfg.loss_ssi_eps,
+            logamp_weight=train_cfg.loss_logamp_weight,
+            logamp_eps=train_cfg.loss_logamp_eps,
         )  # fmt: skip
         if scheduler is not None:
             scheduler.step()
@@ -332,7 +345,11 @@ def run_training(cfgs: Configs) -> RunResult:
                 "model.n_params": n_params,
                 "model.architecture": repr(model).replace("\n", " "),
                 "train.optimizer": "AdamW",
-                "train.loss": "group_balanced_l1",
+                "train.loss": "group_balanced_l1"
+                + ("+residual_l1" if cfgs.train.residual_l1_weight > 0 else "")
+                + ("+ssi" if cfgs.train.loss_ssi_weight > 0 else "")
+                + ("+grad" if cfgs.train.loss_grad_weight > 0 else "")
+                + ("+logamp" if cfgs.train.loss_logamp_weight > 0 else ""),
                 "train.device_name": (
                     torch.cuda.get_device_name(device)
                     if device.startswith("cuda")
