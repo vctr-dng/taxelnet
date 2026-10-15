@@ -73,6 +73,9 @@ class TrainConfig:
     # L1 penalty on the mean |CNN residual| (scaled target units) of hybrid models that
     # expose `model.residual` (footprint_cnn); 0 disables
     residual_l1_weight: float = 0.0
+    # separate lr for the physics parameters (`model.footprint`) of hybrid models;
+    # None = train.lr for every parameter
+    physics_lr: float | None = None
 
 
 @dataclass

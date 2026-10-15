@@ -150,8 +150,15 @@ def fit(
     to `on_checkpoint`.
     """
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    params: list | object = model.parameters()
+    if train_cfg.physics_lr is not None and hasattr(model, "footprint"):
+        phys = {id(p) for p in model.footprint.parameters()}
+        params = [
+            {"params": [p for p in model.parameters() if id(p) not in phys]},
+            {"params": list(model.footprint.parameters()), "lr": train_cfg.physics_lr},
+        ]
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=train_cfg.lr, weight_decay=train_cfg.weight_decay
+        params, lr=train_cfg.lr, weight_decay=train_cfg.weight_decay
     )
     scheduler = (
         torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=train_cfg.epochs)
