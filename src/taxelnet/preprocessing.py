@@ -28,6 +28,7 @@ from taxelnet.io_csv import (
 
 INPUT_SCALERS = ("identity", "max_abs", "zscore", "robust_zscore", "asinh")
 TARGET_SCALERS = ("identity", "global_scale", "per_taxel_zscore", "asinh")
+TARGET_GROUP_KEYS = ("none", "sensor")
 
 Array = TypeVar("Array", np.ndarray, torch.Tensor)
 
@@ -67,6 +68,23 @@ def tensor_contract() -> dict[str, Any]:
     }
 
 
+def _fit_target(config: PreprocessingConfig, y: np.ndarray, with_clamp: bool = False):
+    """(y_center, y_scale[, clamp_lo, clamp_hi]) of the configured target scaler on y."""
+    center, scale, lo, hi = np.zeros(()), np.ones(()), None, None
+    match config.target_scaler:
+        case "global_scale":
+            scale = np.array(y.std())
+        case "per_taxel_zscore":
+            center, scale = y.mean(axis=0), y.std(axis=0)
+        case "asinh":
+            if not config.asinh_scale > 0:
+                raise ValueError(f"asinh_scale must be > 0, got {config.asinh_scale}")
+            lo, hi = amp.asinh_clamp_bounds(
+                y, config.asinh_scale, config.asinh_clamp_margin
+            )
+    return (center, scale, lo, hi) if with_clamp else (center, scale)
+
+
 @dataclass
 class Preprocessor:
     config: PreprocessingConfig
@@ -81,16 +99,30 @@ class Preprocessor:
     y_clamp_hi: float | None = None
     fitted_on: str | None = None
     n_fit_rows: int = 0
+    # target_group_key != "none": one (y_center, y_scale) per group label (e.g. pad S1/S2),
+    # fitted on that group's training rows; y_center / y_scale then have a leading
+    # (n_groups,) axis in the order of `group_labels`
+    group_labels: list[str] = field(default_factory=list)
 
     @classmethod
     def fit(
-        cls, config: PreprocessingConfig, x_train: np.ndarray, y_train: np.ndarray
+        cls,
+        config: PreprocessingConfig,
+        x_train: np.ndarray,
+        y_train: np.ndarray,
+        group_train: np.ndarray | None = None,
     ) -> Preprocessor:
-        """Fit on training rows only: x_train (N, H, W) mm, y_train (N, h, w) TC."""
+        """Fit on training rows only: x_train (N, H, W) mm, y_train (N, h, w) TC.
+
+        `group_train` (N,) holds each row's group label (sensor); required when
+        `config.target_group_key != "none"`, ignored otherwise.
+        """
         if config.input_scaler not in INPUT_SCALERS:
             raise ValueError(f"input_scaler must be one of {INPUT_SCALERS}")
         if config.target_scaler not in TARGET_SCALERS:
             raise ValueError(f"target_scaler must be one of {TARGET_SCALERS}")
+        if config.target_group_key not in TARGET_GROUP_KEYS:
+            raise ValueError(f"target_group_key must be one of {TARGET_GROUP_KEYS}")
         pre = cls(config, fitted_on="train", n_fit_rows=len(x_train))
 
         x = pre._clip(np.asarray(x_train, dtype=np.float64))
@@ -110,17 +142,24 @@ class Preprocessor:
             raise ValueError(f"degenerate input scale {pre.x_scale}")
 
         y = np.asarray(y_train, dtype=np.float64)
-        match config.target_scaler:
-            case "global_scale":
-                pre.y_scale = np.array(y.std())
-            case "per_taxel_zscore":
-                pre.y_center, pre.y_scale = y.mean(axis=0), y.std(axis=0)
-            case "asinh":
-                if not config.asinh_scale > 0:
-                    raise ValueError(f"asinh_scale must be > 0, got {config.asinh_scale}")
-                pre.y_clamp_lo, pre.y_clamp_hi = amp.asinh_clamp_bounds(
-                    y, config.asinh_scale, config.asinh_clamp_margin
+        if config.target_group_key != "none":
+            if config.target_scaler not in ("global_scale", "per_taxel_zscore"):
+                raise ValueError(
+                    "target_group_key needs target_scaler global_scale or per_taxel_zscore"
                 )
+            if group_train is None or len(group_train) != len(y):
+                raise ValueError("target_group_key needs one group label per train row")
+            labels = np.asarray(group_train).astype(str)
+            pre.group_labels = sorted(set(labels))
+            fits = [_fit_target(config, y[labels == g]) for g in pre.group_labels]
+            pre.y_center = np.stack([c for c, _ in fits])
+            pre.y_scale = np.stack([s for _, s in fits])
+            if config.target_scaler == "global_scale":
+                pre.y_center = np.zeros_like(pre.y_scale)
+        else:
+            pre.y_center, pre.y_scale, pre.y_clamp_lo, pre.y_clamp_hi = _fit_target(
+                config, y, with_clamp=True
+            )
         if not (pre.y_scale > 0).all():
             raise ValueError("degenerate target scale")
         return pre
@@ -142,16 +181,39 @@ class Preprocessor:
             x = asinh_compress(x, self.config.input_asinh_scale)
         return (x - self.x_center) / self.x_scale
 
-    def transform_y(self, y: Array) -> Array:
+    def _y_params(self, y: Array, group: np.ndarray | None) -> tuple[Any, Any]:
+        """(center, scale) broadcastable to y (N, h, w): global, or one per row's group."""
+        if self.config.target_group_key == "none":
+            return self._like(self.y_center, y), self._like(self.y_scale, y)
+        if group is None:
+            raise ValueError(
+                f"target_group_key={self.config.target_group_key!r} needs per-row labels"
+            )
+        labels = np.asarray(group).astype(str)
+        unknown = sorted(set(labels) - set(self.group_labels))
+        if unknown:
+            raise ValueError(f"group labels {unknown} not in fitted {self.group_labels}")
+        idx = np.array([self.group_labels.index(g) for g in labels])
+        pad = (1,) * (y.ndim - 1 - (self.y_scale.ndim - 1))
+        return tuple(
+            self._like(a[idx].reshape(a[idx].shape + pad), y)
+            for a in (self.y_center, self.y_scale)
+        )
+
+    def transform_y(self, y: Array, group: np.ndarray | None = None) -> Array:
         if self.config.target_scaler == "asinh":
             return amp.asinh_forward(y, self.config.asinh_scale)
-        return (y - self._like(self.y_center, y)) / self._like(self.y_scale, y)
+        center, scale = self._y_params(y, group)
+        return (y - center) / scale
 
-    def inverse_y(self, y: Array, clamp: bool = True) -> Array:
+    def inverse_y(
+        self, y: Array, clamp: bool = True, group: np.ndarray | None = None
+    ) -> Array:
         if self.config.target_scaler == "asinh":
             lo, hi = (self.y_clamp_lo, self.y_clamp_hi) if clamp else (None, None)
             return amp.asinh_inverse(y, self.config.asinh_scale, lo, hi)
-        return y * self._like(self.y_scale, y) + self._like(self.y_center, y)
+        center, scale = self._y_params(y, group)
+        return y * scale + center
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -170,6 +232,7 @@ class Preprocessor:
                 "y_scale": np.asarray(self.y_scale).tolist(),
                 "y_clamp_lo": self.y_clamp_lo,
                 "y_clamp_hi": self.y_clamp_hi,
+                "group_labels": self.group_labels,
             },
             "formulas": {
                 "input": (
@@ -178,7 +241,12 @@ class Preprocessor:
                     if self.config.input_scaler == "asinh"
                     else "x_scaled = (clip(x_mm) - x_center) / x_scale"
                 ),
-                "target": "y_scaled = (y_tc - y_center) / y_scale",
+                "target": (
+                    "y_scaled = (y_tc - y_center) / y_scale"
+                    if self.config.target_group_key == "none"
+                    else "y_scaled = (y_tc - y_center[g]) / y_scale[g], g = row's "
+                    "group_labels index (y_center / y_scale have a leading group axis)"
+                ),
                 "inverse": "y_tc = y_scaled * y_scale + y_center",
                 "asinh_target": "y_scaled = asinh(y_tc / asinh_scale)",
                 "asinh_inverse": (
@@ -208,4 +276,5 @@ class Preprocessor:
             y_clamp_hi=fitted.get("y_clamp_hi"),
             fitted_on=fitted["fitted_on"],
             n_fit_rows=fitted["n_fit_rows"],
+            group_labels=fitted.get("group_labels", []),
         )

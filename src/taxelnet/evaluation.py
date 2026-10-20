@@ -35,7 +35,8 @@ def predict(
     out = []
     for start in range(0, len(ds), batch_size):
         x = ds.x[start : start + batch_size].to(device)
-        out.append(pre.inverse_y(model(x)).float().cpu())
+        sensor = None if ds.sensor is None else ds.sensor[start : start + batch_size]
+        out.append(pre.inverse_y(model(x), group=sensor).float().cpu())
     pred = torch.cat(out).numpy()
     if pred.shape != (len(ds), *ds.taxel_shape):
         raise ValueError(

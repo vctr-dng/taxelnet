@@ -83,3 +83,62 @@ def test_json_round_trip(tmp_path):
 def test_unknown_scaler_rejected():
     with pytest.raises(ValueError, match="input_scaler"):
         Preprocessor.fit(PreprocessingConfig(input_scaler="minmax"), X, Y)
+
+
+# --- per-group (sensor) target normalization ---------------------------------------------
+
+SENSOR = np.array(["S1"] * 10 + ["S2"] * 10)
+Y_S = Y.copy()
+Y_S[10:] = Y_S[10:] * 3.4 + 500  # S2 reads larger, with an offset
+
+
+@pytest.mark.parametrize("target_scaler", ["global_scale", "per_taxel_zscore"])
+def test_group_scaler_fits_each_group_and_round_trips(target_scaler):
+    cfg = PreprocessingConfig(target_scaler=target_scaler, target_group_key="sensor")
+    pre = Preprocessor.fit(cfg, X, Y_S, SENSOR)
+    assert pre.group_labels == ["S1", "S2"]
+
+    scaled = pre.transform_y(Y_S, SENSOR)
+    for g in ("S1", "S2"):
+        sel = SENSOR == g
+        ref = Preprocessor.fit(PreprocessingConfig(target_scaler=target_scaler), X, Y_S[sel])
+        np.testing.assert_allclose(scaled[sel], ref.transform_y(Y_S[sel]), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(pre.inverse_y(scaled, group=SENSOR), Y_S, rtol=1e-4, atol=1e-2)
+
+    t = pre.inverse_y(torch.as_tensor(scaled), group=SENSOR)  # torch path
+    np.testing.assert_allclose(t.numpy(), Y_S, rtol=1e-4, atol=1e-2)
+    # a prediction is inverted with its own row's parameters
+    s1 = pre.inverse_y(scaled[:1], group=np.array(["S2"]))
+    assert not np.allclose(s1, Y_S[:1])
+
+
+def test_group_scaler_json_round_trip(tmp_path):
+    cfg = PreprocessingConfig(target_scaler="per_taxel_zscore", target_group_key="sensor")
+    pre = Preprocessor.fit(cfg, X, Y_S, SENSOR)
+    pre.save(tmp_path / "p.json")
+    loaded = Preprocessor.load(tmp_path / "p.json")
+    assert loaded.group_labels == ["S1", "S2"]
+    np.testing.assert_allclose(loaded.transform_y(Y_S, SENSOR), pre.transform_y(Y_S, SENSOR))
+    assert np.asarray(pre.to_dict()["fitted"]["y_scale"]).shape == (2, 7, 4)
+
+
+def test_group_key_requires_labels_and_known_group():
+    cfg = PreprocessingConfig(target_group_key="sensor")
+    with pytest.raises(ValueError):
+        Preprocessor.fit(cfg, X, Y_S)
+    pre = Preprocessor.fit(cfg, X, Y_S, SENSOR)
+    with pytest.raises(ValueError):
+        pre.transform_y(Y_S)
+    with pytest.raises(ValueError):
+        pre.transform_y(Y_S[:1], np.array(["S3"]))
+    with pytest.raises(ValueError):
+        Preprocessor.fit(PreprocessingConfig(target_scaler="asinh", target_group_key="sensor"), X, Y_S, SENSOR)
+
+
+def test_no_group_key_ignores_labels_and_is_unchanged():
+    cfg = PreprocessingConfig(target_scaler="per_taxel_zscore")
+    a = Preprocessor.fit(cfg, X, Y_S)
+    b = Preprocessor.fit(cfg, X, Y_S, SENSOR)
+    assert b.group_labels == []
+    np.testing.assert_allclose(a.transform_y(Y_S), b.transform_y(Y_S, SENSOR))
+    assert a.to_dict()["fitted"] == b.to_dict()["fitted"] | {}

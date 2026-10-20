@@ -152,7 +152,10 @@ def evaluate_loss(
     model.eval()
     preds = torch.cat([model(ds.x[i : i + 1024]) for i in range(0, len(ds), 1024)])
     loss = group_balanced_l1(preds, ds.y, ds.group, alpha).item()
-    raw_err = (pre.inverse_y(preds) - pre.inverse_y(ds.y)).abs().flatten(1).mean(1)
+    raw_err = (
+        (pre.inverse_y(preds, group=ds.sensor) - pre.inverse_y(ds.y, group=ds.sensor))
+        .abs().flatten(1).mean(1)
+    )  # fmt: skip
     if not math.isfinite(loss):
         raise FloatingPointError(f"non-finite evaluation loss {loss}")
     return {
@@ -297,8 +300,15 @@ def run_training(cfgs: Configs) -> RunResult:
         print(f"held-out val shapes: {', '.join(split.held_out_shapes)}")
     train_rows = split.rows["train"]
     pre = Preprocessor.fit(
-        cfgs.preprocessing, paired.x[train_rows], paired.y[train_rows]
+        cfgs.preprocessing,
+        paired.x[train_rows],
+        paired.y[train_rows],
+        None if paired.sensor is None else paired.sensor[train_rows],
     )
+    if cfgs.preprocessing.target_group_key != "none":
+        if cfgs.train.loss_logamp_weight > 0:
+            raise ValueError("loss_logamp_weight is not supported with target_group_key")
+        print(f"per-group target scalers: {pre.group_labels}")
     device = cfgs.train.device
     # partition -> (paired data, rows): train/val from the training pair, test external
     sources: dict[str, tuple[PairedData, np.ndarray]] = {
@@ -314,7 +324,11 @@ def run_training(cfgs: Configs) -> RunResult:
 
     if cfgs.model.head_activation == "tanh_bounded":
         lo, hi = head_bounds(
-            pre.transform_y(paired.y[train_rows]), cfgs.model.head_bound_margin
+            pre.transform_y(
+                paired.y[train_rows],
+                None if paired.sensor is None else paired.sensor[train_rows],
+            ),
+            cfgs.model.head_bound_margin,
         )
         if cfgs.model.head_lower is None:
             cfgs.model.head_lower = lo

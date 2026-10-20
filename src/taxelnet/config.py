@@ -50,6 +50,10 @@ class PreprocessingConfig:
     asinh_clamp_margin: float = 0.25
     # asinh only: x' = asinh(x / s) / asinh(max|x_train| / s), s in mm (taxelnet.saturation)
     input_asinh_scale: float = 0.2
+    # none | sensor: fit the target scaler (global_scale | per_taxel_zscore only)
+    # separately per pad label (S1/S2, the Path/Name suffix) and invert with each row's own
+    # parameters. The network input never sees the label.
+    target_group_key: str = "none"
 
 
 @dataclass
