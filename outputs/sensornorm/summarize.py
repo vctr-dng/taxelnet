@@ -7,6 +7,7 @@ scripts/calibrate_eval.py, if present). Then mean +- std over seeds per arm.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 from pathlib import Path
@@ -16,7 +17,7 @@ import polars as pl
 
 from taxelnet.checkpoint import load_model
 from taxelnet.config import DataConfig
-from taxelnet.dataset import TaxelDataset, load_paired
+from taxelnet.dataset import TaxelDataset, load_paired, load_test_paired
 from taxelnet.evaluation import predict
 from taxelnet.preprocessing import Preprocessor
 from taxelnet.splits import make_split
@@ -68,6 +69,28 @@ def test_per_sensor(bundle: Path) -> dict[str, float]:
     return out
 
 
+def buttons_with_s1_scaler(bundle: Path) -> dict[str, float]:
+    """Sensitivity: Cylinder_TestButtons (labelled S2, signal looks S1) scored with S1 scaler."""
+    cfg = json.loads((bundle / "config.json").read_text())["data"]
+    data = DataConfig(
+        test_dir=Path(cfg["test_dir"]), test_real_csv=cfg["test_real_csv"],
+        test_sim_csv=cfg["test_sim_csv"], test_key_cols=tuple(cfg["test_key_cols"]),
+        cache_dir=Path(cfg["cache_dir"]),
+    )  # fmt: skip
+    test = load_test_paired(data)
+    pre = Preprocessor.load(bundle / "preprocessing.json")
+    if not pre.group_labels:
+        return {}
+    sens = test.sensor.copy()
+    btn = np.array(["TestButtons" in test.groups[g]["path"] for g in test.group])
+    sens[btn] = "S1"
+    test = dataclasses.replace(test, sensor=sens)
+    rows = np.arange(len(test.group))
+    pred = predict(load_model(bundle / "model.pt"), TaxelDataset(test, rows, pre.transform_x, pre.transform_y), pre)
+    err = np.abs(pred - test.y).reshape(len(rows), -1).mean(1)
+    return {"buttons_s1scaler": float(err[btn].mean())}
+
+
 def collect(bundle: Path) -> dict:
     m = json.loads((bundle / "metrics.json").read_text())
     t, v = m["test"], m["val"]
@@ -81,7 +104,7 @@ def collect(bundle: Path) -> dict:
         "test_amp_logratio": t["amp_logratio_median"],
         **{g: t[f"group_{g}_mae"] for g in GROUPS},
         **{f"zero_{g}": t["reference"]["trivial_zero"][f"group_{g}_mae"] for g in GROUPS},
-        **val_per_sensor(bundle), **test_per_sensor(bundle),
+        **val_per_sensor(bundle), **test_per_sensor(bundle), **buttons_with_s1_scaler(bundle),
     }  # fmt: skip
     r["test_objmacro_mae"] = float(np.mean([r[g] for g in GROUPS]))
     c = CALIB.get(run)
@@ -96,7 +119,8 @@ COLS = [
     ("test_objmacro_mae", "4-grp mean"), ("calib_k5", "calib k=5"),
     ("test_S1_mae", "test S1"), ("test_S2_mae", "test S2"),
     ("Cuboid_TestXS_20", "Cuboid"), ("Sphere_TestG_20", "Sphere"),
-    ("Cylinder_TestM_235", "Cyl M"), ("Cylinder_TestButtons_235", "Cyl Buttons"),
+    ("Cylinder_TestM_235", "Cyl M"), ("Cylinder_TestButtons_235", "Cyl Buttons (S2 scaler)"),
+    ("buttons_s1scaler", "Cyl Buttons (S1 scaler)"),
     ("test_cosine", "cos"), ("test_aligned_mae", "aligned"), ("test_peak_hit", "peak hit"),
     ("test_ssim", "SSIM"), ("test_amp_logratio", "amp logratio"),
 ]
