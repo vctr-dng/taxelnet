@@ -146,6 +146,11 @@ def test_run_training_two_epochs(tmp_path, synthetic_pair, grasp_pair):
     loaded = load_model(result.run_dir / "model.pt")
     np.testing.assert_allclose(predict(loaded, ds, pre), expected, rtol=1e-5, atol=1e-3)
 
+    # test pads rescaled from their own readings: own y_scale and fitted gain
+    for key in ("padgain_k5_mae", "padgain_oracle_ssim", "testscale_k5_mae",
+                "testscale_all_mae", "testscale_all_factor_S1"):  # fmt: skip
+        assert math.isfinite(metrics["test"][key]), key
+
     # warm start: weights and input scaler come from the first bundle
     cfgs.train.init_from = result.run_dir
     cfgs.train.epochs, cfgs.train.test_every = 1, 0

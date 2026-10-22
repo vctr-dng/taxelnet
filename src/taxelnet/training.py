@@ -37,9 +37,11 @@ from taxelnet.dataset import (
     load_paired,
     load_test_paired,
 )
+from taxelnet.calibration import unseen_pad_metrics
 from taxelnet.evaluation import (
     compute_metrics,
     global_ssim,
+    object_group,
     object_metrics,
     predict,
     predictions_frame,
@@ -459,6 +461,27 @@ def run_training(cfgs: Configs) -> RunResult:
         test_rows = np.arange(len(test_group))
         test_all_titles = reading_titles(test, test_rows)
         test_labels = group_labels(test, test_rows)
+        test_objects = np.array([object_group(s) for s in test_names])
+
+        # training-pad y_scale per test pad label (global_scale only: a pure division)
+        train_scale = None
+        if test.sensor is not None and cfgs.preprocessing.target_scaler == "global_scale":
+            if pre.group_labels:
+                train_scale = {
+                    g: float(s) for g, s in zip(pre.group_labels, pre.y_scale)
+                }
+            else:
+                train_scale = {q: float(pre.y_scale) for q in set(test.sensor)}
+
+        def pad_metrics(pred: np.ndarray) -> dict[str, float]:
+            """Test pads are not the training pads: rescaled per test pad from its own
+            readings, by its own y_scale (testscale_*) or a fitted gain (padgain_*)."""
+            if test.sensor is None:
+                return {}
+            return unseen_pad_metrics(
+                pred, test_target, test.sensor, test_objects, train_scale,
+                cfgs.eval.ssim_data_range,
+            )  # fmt: skip
 
         def evaluate_test(model: nn.Module, name: str, title: str) -> dict:
             """Test metrics of `model` + inference plots in plots/<name>/."""
@@ -467,6 +490,7 @@ def run_training(cfgs: Configs) -> RunResult:
                 pred, test_target, test_group, cfgs.eval.ssim_data_range
             )
             m |= object_metrics(pred, test_target, test_group, test_names)
+            m |= pad_metrics(pred)
             out = run_dir / "plots" / name
             save_inference_plots(
                 out, test.x, test_target, pred, m, plot_pos,
@@ -565,7 +589,7 @@ def run_training(cfgs: Configs) -> RunResult:
             if p == TEST:
                 obj = object_metrics(pred, target, group, test_names)
                 metrics[p]["reference"]["trivial_zero"] |= obj.pop("reference")
-                metrics[p] |= obj
+                metrics[p] |= obj | pad_metrics(pred)
                 if len(pred) != len(test.group):
                     raise AssertionError("test predictions do not cover the test file")
                 predictions_frame(src, rows, p, pred).write_parquet(

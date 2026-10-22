@@ -21,7 +21,7 @@ from typing import Any
 
 import numpy as np
 
-from taxelnet.evaluation import _group_mean, decomposed_metrics
+from taxelnet.evaluation import _group_mean, decomposed_metrics, global_ssim
 
 VARIANTS = ("none", "global_gain", "global_affine", "taxel_affine")
 IRLS_EPS = 1.0  # TC: residual floor of the IRLS weights 1 / max(|r|, eps)
@@ -235,3 +235,84 @@ def shots_to_oracle(
         if res[str(k)][f"{metric}_mean"] <= (1 + tol) * oracle:
             return k
     return None
+
+
+def unseen_pad_metrics(
+    pred: np.ndarray,
+    target: np.ndarray,
+    pads: np.ndarray,
+    objects: np.ndarray,
+    train_scale: dict[str, float] | None,
+    ssim_data_range: float,
+    ks: tuple[int, ...] = (5, 20),
+    n_draws: int = 50,
+    seed: int = 0,
+) -> dict[str, float]:
+    """Test metrics for pads unseen in training, each pad rescaled from its own readings.
+
+    `pred` is in TC with the *training* pad scale (`train_scale[pad]`, the global_scale
+    std of that pad's training targets). Two ways to adapt it to a test pad, both
+    computed from readings of that pad only:
+
+    - ``testscale``: replace the training scale by the test pad's own y_scale, the std of
+      its real readings (same statistic as the training scaler): pred * s_test / s_train.
+      Needs only real readings. Skipped when `train_scale` is None.
+    - ``padgain``: one L1 gain fitted on predicted vs real maps of the pad's readings
+      (``global_gain``); needs the simulated deformation of those readings.
+
+    `<family>_k<k>_*`: per draw, `k` random readings of each pad give its scale or gain,
+    scored on every other test reading (mean over `n_draws` draws, the same draws for
+    both families). `<family>_all_*` (testscale) / `padgain_oracle_*`: computed from all
+    readings of the pad and scored on them (optimistic: uses every test label).
+    Metrics: `_mae` (per-reading MAE averaged over readings), `_obj_mean_mae` (mean of
+    the per-object MAEs), `_ssim` (mean per-reading global SSIM).
+    """
+    n = len(pred)
+    p, t = _flat(pred).astype(np.float64), _flat(target).astype(np.float64)
+    pads, objects = np.asarray(pads).astype(str), np.asarray(objects).astype(str)
+    pad_rows = {q: np.flatnonzero(pads == q) for q in sorted(set(pads))}
+
+    def factors(family: str, fit_rows: dict[str, np.ndarray]) -> dict[str, float]:
+        if family == "padgain":
+            return {
+                q: float(fit_global_gain(p[r], t[r]).gain) for q, r in fit_rows.items()
+            }
+        return {q: float(t[r].std()) / train_scale[q] for q, r in fit_rows.items()}
+
+    def score(f: dict[str, float], keep: np.ndarray) -> np.ndarray:
+        cal = p.copy()
+        for q, factor in f.items():
+            cal[pads == q] *= factor
+        err = np.abs(cal - t).mean(1)[keep]
+        obj = objects[keep]
+        per_obj = [err[obj == o].mean() for o in sorted(set(obj))]
+        ssim = global_ssim(cal[keep], t[keep], ssim_data_range)
+        return np.array([err.mean(), np.mean(per_obj), ssim.mean()])
+
+    families = ["padgain"] + (["testscale"] if train_scale is not None else [])
+    names = ("mae", "obj_mean_mae", "ssim")
+    out: dict[str, float] = {}
+    rng = np.random.default_rng(seed)
+    for k in ks:
+        acc = {fam: [] for fam in families}
+        for _ in range(n_draws):
+            fit_rows = {
+                q: rng.choice(r, min(k, len(r) - 1), replace=False)
+                for q, r in pad_rows.items()
+            }
+            keep = np.ones(n, bool)
+            keep[np.concatenate(list(fit_rows.values()))] = False
+            for fam in families:
+                acc[fam].append(score(factors(fam, fit_rows), keep))
+        for fam in families:
+            mean = np.mean(acc[fam], axis=0)
+            out |= {f"{fam}_k{k}_{m}": float(v) for m, v in zip(names, mean)}
+    everything = np.ones(n, bool)
+    for fam, tag in (("padgain", "oracle"), ("testscale", "all")):
+        if fam in families:
+            res = score(factors(fam, pad_rows), everything)
+            out |= {f"{fam}_{tag}_{m}": float(v) for m, v in zip(names, res)}
+            out |= {
+                f"{fam}_{tag}_factor_{q}": v for q, v in factors(fam, pad_rows).items()
+            }
+    return out
