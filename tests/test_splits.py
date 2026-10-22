@@ -12,6 +12,7 @@ from taxelnet.splits import (
     PARTITIONS,
     allocate_groups,
     make_split,
+    shape_folds,
     shared_keys,
     split_manifest,
 )
@@ -124,6 +125,37 @@ def test_make_split_shape_holds_out_whole_shapes(paired_cfg, grasp_pair):
     )
     assert manifest["config"]["split_strategy"] == "shape"
     assert manifest["held_out_shapes"] == list(split.held_out_shapes)
+
+
+def test_shape_folds_balance_and_cover():
+    sizes = np.array([678, 630, 392, 344, 322, 319, 308, 288, 256, 236, 221, 216, 208])
+    fold = shape_folds(sizes, 5)
+    assert set(fold.tolist()) == set(range(5))
+    loads = np.bincount(fold, weights=sizes)
+    assert loads.max() - loads.min() <= sizes.max()
+    assert (fold == shape_folds(sizes, 5)).all()  # deterministic
+    with pytest.raises(ValueError):
+        shape_folds(sizes, 1)
+
+
+def test_make_split_shape_fold_partitions_shapes(paired_cfg):
+    paired, cfg = paired_cfg
+    cfg.split_strategy, cfg.n_folds = "shape_fold", 2
+    held = []
+    for fold in range(2):
+        cfg.fold = fold
+        split = make_split(paired, cfg)
+        shapes = {
+            p: {paired.groups[g]["path"].split("/")[0] for g in paired.group[rows]}
+            for p, rows in split.rows.items()
+        }
+        assert shapes["train"].isdisjoint(shapes["val"])
+        assert set(split.held_out_shapes) == shapes["val"]
+        held.append(set(split.held_out_shapes))
+    assert held[0].isdisjoint(held[1])  # every shape is val in exactly one fold
+    cfg.fold = 2
+    with pytest.raises(ValueError, match="fold"):
+        make_split(paired, cfg)
 
 
 def test_make_split_rejects_unknown_strategy(paired_cfg):

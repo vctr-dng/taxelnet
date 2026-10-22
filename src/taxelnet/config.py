@@ -26,6 +26,9 @@ class DataConfig:
     # group: (force, Path) groups split independently (force interpolation on seen
     # shapes); shape: whole indenter shapes (Path before "/") held out in val
     split_strategy: str = "group"
+    # shape_fold: k-fold over whole shapes, `fold` (0-based) is the val fold
+    n_folds: int = 5
+    fold: int = 0
     # external test pair (grasp export): evaluated only, never split or fitted on
     test_dir: Path = Path("data/newton/v1/test")
     test_real_csv: str = "Dataset_Grasp_Real_qtac100_testing.csv"
