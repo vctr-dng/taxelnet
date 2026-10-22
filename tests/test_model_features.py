@@ -55,3 +55,19 @@ def test_derived_features_on_flat_and_quadratic_inputs():
     lap = DerivedFeatures.laplacian((r**2 + c**2)[None, None])
     inner = lap[0, 0, 1:-1, 1:-1]
     assert torch.allclose(inner, inner[0, 0].expand_as(inner))
+
+
+def test_cnn_v0_taxel_convs():
+    import torch
+
+    from taxelnet.config import ModelConfig
+    from taxelnet.model import build_model
+
+    base = build_model(ModelConfig(), (7, 4))
+    deep = build_model(ModelConfig(taxel_convs=2), (7, 4))
+    x = torch.randn(2, 1, 77, 49)
+    assert deep(x).shape == base(x).shape == (2, 7, 4)
+    extra = sum(p.numel() for p in deep.parameters()) - sum(
+        p.numel() for p in base.parameters()
+    )
+    assert extra == 2 * (64 * 64 * 9 + 64)

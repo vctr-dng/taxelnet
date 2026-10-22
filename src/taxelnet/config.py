@@ -81,6 +81,10 @@ class ModelConfig:
     # footprint_cnn only: CNN residual branch, cnn_v0 | cnn_feat (uses the three
     # cnn_feat knobs above)
     residual_backbone: str = "cnn_v0"
+    # cnn_v0 only: 3x3 conv + ReLU layers on the pooled taxel-resolution map before the
+    # 1x1 head (0 = original head); taxel_channels 0 = keep the encoder's channel count
+    taxel_convs: int = 0
+    taxel_channels: int = 0
 
 
 @dataclass
