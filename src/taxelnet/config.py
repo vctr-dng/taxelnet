@@ -122,6 +122,8 @@ class EvalConfig:
     # fixed SSIM data range in TC, spanning the real target range (about -888 to 2,711)
     ssim_data_range: float = 3600.0
     plot_samples: int = 6  # test readings drawn in the inference plots
+    # readings drawn per (object, force, pad) group in plots/<name>/samples/<group>.png
+    plot_samples_per_group: int = 3
 
 
 @dataclass

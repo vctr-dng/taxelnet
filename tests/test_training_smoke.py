@@ -42,6 +42,8 @@ BUNDLE = [
     "plots/epoch_0002/per_taxel_mae.png",
     "plots/epoch_0003/test_metrics.json",
     "plots/best/samples.png",
+    "plots/best/ssim_by_group.png",
+    "plots/best_val/ssim_by_group.png",
 ]
 
 
@@ -121,6 +123,7 @@ def test_run_training_two_epochs(tmp_path, synthetic_pair, grasp_pair):
         "plots/epoch_0002",
         "plots/epoch_0003",
         "plots/best",
+        "plots/best_val",
     }
     assert {a.path for a in client.list_artifacts(result.run_id, "checkpoints")} == {
         "checkpoints/epoch_0002.pt",
