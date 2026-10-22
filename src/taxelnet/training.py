@@ -25,6 +25,7 @@ from taxelnet import amp, artifacts
 from taxelnet.checkpoint import (
     ARTIFACT_CONTRACT_VERSION,
     load_checkpoint,
+    load_model,
     save_checkpoint,
     save_model,
 )
@@ -310,6 +311,16 @@ def run_training(cfgs: Configs) -> RunResult:
         paired.y[train_rows],
         None if paired.sensor is None else paired.sensor[train_rows],
     )
+    init_from = cfgs.train.init_from
+    if init_from is not None:
+        src_pre = Preprocessor.load(init_from / "preprocessing.json")
+        if src_pre.config.input_scaler != cfgs.preprocessing.input_scaler:
+            raise ValueError(
+                f"init_from input_scaler {src_pre.config.input_scaler!r} != "
+                f"{cfgs.preprocessing.input_scaler!r}"
+            )
+        pre.x_center, pre.x_scale = src_pre.x_center, src_pre.x_scale
+        print(f"init_from {init_from}: input scaler x_scale={pre.x_scale:.4f} reused")
     if cfgs.preprocessing.target_group_key != "none":
         if cfgs.train.loss_logamp_weight > 0:
             raise ValueError("loss_logamp_weight is not supported with target_group_key")
@@ -340,6 +351,9 @@ def run_training(cfgs: Configs) -> RunResult:
         if cfgs.model.head_upper is None:
             cfgs.model.head_upper = hi
     model = build_model(cfgs.model, paired.taxel_shape).to(device)
+    if init_from is not None:
+        # strict: the pre-trained architecture must match this run's model config
+        model.load_state_dict(load_model(init_from / "model.pt").state_dict())
     out = model(ds["train"].x[:1])
     if tuple(out.shape[1:]) != paired.taxel_shape:
         raise ValueError(

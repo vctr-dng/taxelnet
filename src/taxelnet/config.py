@@ -118,6 +118,11 @@ class TrainConfig:
     loss_ssi_weight: float = 0.0
     loss_grad_weight: float = 0.0
     loss_ssi_eps: float = 0.05
+    # warm start (fine-tuning): run bundle whose model.pt weights initialise the model
+    # (same architecture) and whose input scaler (x_center, x_scale) is reused, so the
+    # input means the same as in pre-training; the target scaler is refitted on this
+    # run's training rows. None = random init.
+    init_from: Path | None = None
 
 
 @dataclass

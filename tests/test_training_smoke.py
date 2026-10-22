@@ -145,3 +145,10 @@ def test_run_training_two_epochs(tmp_path, synthetic_pair, grasp_pair):
     np.testing.assert_allclose(predict(model, ds, pre), expected, rtol=1e-5, atol=1e-3)
     loaded = load_model(result.run_dir / "model.pt")
     np.testing.assert_allclose(predict(loaded, ds, pre), expected, rtol=1e-5, atol=1e-3)
+
+    # warm start: weights and input scaler come from the first bundle
+    cfgs.train.init_from = result.run_dir
+    cfgs.train.epochs, cfgs.train.test_every = 1, 0
+    warm = run_training(cfgs)
+    warm_pre = Preprocessor.load(warm.run_dir / "preprocessing.json")
+    assert warm_pre.x_scale == pre.x_scale and warm_pre.x_center == pre.x_center
