@@ -22,6 +22,7 @@ from torch import nn
 from torch.optim import Optimizer
 
 from taxelnet import amp, artifacts
+from taxelnet.calibration import unseen_pad_metrics
 from taxelnet.checkpoint import (
     ARTIFACT_CONTRACT_VERSION,
     load_checkpoint,
@@ -29,7 +30,7 @@ from taxelnet.checkpoint import (
     save_checkpoint,
     save_model,
 )
-from taxelnet.config import Configs, TrainConfig
+from taxelnet.config import Configs, TrackingConfig, TrainConfig
 from taxelnet.dataset import (
     GroupBatchSampler,
     PairedData,
@@ -37,7 +38,6 @@ from taxelnet.dataset import (
     load_paired,
     load_test_paired,
 )
-from taxelnet.calibration import unseen_pad_metrics
 from taxelnet.evaluation import (
     compute_metrics,
     global_ssim,
@@ -55,9 +55,9 @@ from taxelnet.plots import (
     select_plot_samples,
 )
 from taxelnet.preprocessing import Preprocessor
-from taxelnet.ssi import ssi_losses
 from taxelnet.saturation import head_bounds
 from taxelnet.splits import PARTITIONS, TEST, make_split, shared_keys, split_manifest
+from taxelnet.ssi import ssi_losses
 
 Logger = Callable[[dict[str, float], int], object]
 # called with (epoch, model, checkpoint path) after each periodic checkpoint
@@ -283,6 +283,21 @@ def _seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
 
 
+def setup_mlflow(tracking: TrackingConfig) -> None:
+    """Point MLflow at the tracking URI and select (creating if needed) the experiment."""
+    mlflow.set_tracking_uri(tracking.resolved_uri())
+    if mlflow.get_experiment_by_name(tracking.experiment) is None:
+        try:
+            mlflow.create_experiment(
+                tracking.experiment, artifact_location=tracking.artifact_location
+            )
+        except mlflow.exceptions.MlflowException:
+            # a concurrent run created it first
+            if mlflow.get_experiment_by_name(tracking.experiment) is None:
+                raise
+    mlflow.set_experiment(tracking.experiment)
+
+
 def run_training(cfgs: Configs) -> RunResult:
     """Training data -> train/val split -> train-only preprocessing -> fit -> evaluation
     on the external test pair -> bundle, all tracked in one MLflow run."""
@@ -325,7 +340,9 @@ def run_training(cfgs: Configs) -> RunResult:
         print(f"init_from {init_from}: input scaler x_scale={pre.x_scale:.4f} reused")
     if cfgs.preprocessing.target_group_key != "none":
         if cfgs.train.loss_logamp_weight > 0:
-            raise ValueError("loss_logamp_weight is not supported with target_group_key")
+            raise ValueError(
+                "loss_logamp_weight is not supported with target_group_key"
+            )
         print(f"per-group target scalers: {pre.group_labels}")
     device = cfgs.train.device
     # partition -> (paired data, rows): train/val from the training pair, test external
@@ -367,18 +384,7 @@ def run_training(cfgs: Configs) -> RunResult:
     run_dir = cfgs.train.output_dir / f"{time.strftime('%Y%m%d-%H%M%S')}_{run_name}"
     run_dir.mkdir(parents=True, exist_ok=False)
 
-    mlflow.set_tracking_uri(cfgs.tracking.resolved_uri())
-    if mlflow.get_experiment_by_name(cfgs.tracking.experiment) is None:
-        try:
-            mlflow.create_experiment(
-                cfgs.tracking.experiment,
-                artifact_location=cfgs.tracking.artifact_location,
-            )
-        except mlflow.exceptions.MlflowException:
-            # a concurrent run created it first
-            if mlflow.get_experiment_by_name(cfgs.tracking.experiment) is None:
-                raise
-    mlflow.set_experiment(cfgs.tracking.experiment)
+    setup_mlflow(cfgs.tracking)
 
     with mlflow.start_run(run_name=run_name) as run:
         run_id = run.info.run_id
@@ -465,7 +471,10 @@ def run_training(cfgs: Configs) -> RunResult:
 
         # training-pad y_scale per test pad label (global_scale only: a pure division)
         train_scale = None
-        if test.sensor is not None and cfgs.preprocessing.target_scaler == "global_scale":
+        if (
+            test.sensor is not None
+            and cfgs.preprocessing.target_scaler == "global_scale"
+        ):
             if pre.group_labels:
                 train_scale = {
                     g: float(s) for g, s in zip(pre.group_labels, pre.y_scale)
