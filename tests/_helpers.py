@@ -103,16 +103,23 @@ def write_synthetic_pair(tmp_path: Path, n_keys: int = 60, seed: int = 0):
     )
 
 
-def write_grasp_pair(out_dir: Path, n: int = 20, seed: int = 1) -> tuple[Path, Path]:
+def write_grasp_pair(
+    out_dir: Path,
+    n: int = 20,
+    seed: int = 1,
+    obj: str = "Sphere_TestG",
+    pads: tuple[str, ...] = ("S1",),
+) -> tuple[Path, Path]:
     """A learnable pair with the test (grasp) schema: `force, Name`, no `dataset`, and
-    `std1 ... std28` after the taxels. Written to `out_dir`, created if needed."""
+    `std1 ... std28` after the taxels. Written to `out_dir`, created if needed. Names are
+    `<obj>_<grip>_<i>_<pad>`, pads cycling through `pads`."""
     out_dir.mkdir(parents=True, exist_ok=True)
     real_csv, sim_csv = out_dir / "grasp_real.csv", out_dir / "grasp_sim.csv"
     sims, reals = _synthetic_grids(n, seed)
     rows = [
         (
             "20.0" if i % 2 else "235.0",
-            f"Sphere_TestG_{'20' if i % 2 else '235'}_{i}_S1",
+            f"{obj}_{'20' if i % 2 else '235'}_{i}_{pads[i % len(pads)]}",
         )
         for i in range(n)
     ]

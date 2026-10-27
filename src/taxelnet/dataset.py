@@ -197,6 +197,45 @@ def load_test_paired(data_cfg: DataConfig) -> PairedData:
     )
 
 
+def read_blacklist(csv: Path, name_col: str = "Name") -> set[str]:
+    """Key names listed in a blacklist CSV (e.g. flagged_grasp_high_readings.csv)."""
+    return set(pl.read_csv(csv, columns=[name_col])[name_col].to_list())
+
+
+def drop_names(
+    paired: PairedData, names: set[str], strict: bool = True
+) -> tuple[PairedData, int]:
+    """`paired` without the rows whose key name (`path`) is in `names`, and their count.
+
+    Groups are re-indexed over the kept rows; `source_rows` keeps the CSV provenance.
+    `strict`: every name must occur in `paired` (a blacklist made for this file).
+    """
+    path_of = np.array([g["path"] for g in paired.groups], dtype=object)
+    if strict:
+        missing = names - set(path_of)
+        if missing:
+            raise ValueError(
+                f"{len(missing)} blacklisted names not in {paired.files[0].name}, "
+                f"e.g. {sorted(missing)[:MAX_REPORTED]}"
+            )
+    dropped_group = np.array([p in names for p in path_of], dtype=bool)
+    keep = ~dropped_group[paired.group]
+    kept_groups = np.flatnonzero(~dropped_group)
+    new_index = np.full(len(paired.groups), -1, dtype=np.int64)
+    new_index[kept_groups] = np.arange(len(kept_groups))
+    filtered = PairedData(
+        x=paired.x[keep],
+        y=paired.y[keep],
+        group=new_index[paired.group[keep]],
+        source_rows=paired.source_rows[keep],
+        groups=[paired.groups[g] for g in kept_groups],
+        files=paired.files,
+        n_sim_differ=paired.n_sim_differ,
+        sensor=None if paired.sensor is None else paired.sensor[keep],
+    )
+    return filtered, int((~keep).sum())
+
+
 class TaxelDataset(Dataset):
     """Rows of a partition with fitted transforms applied once, kept as tensors.
 
