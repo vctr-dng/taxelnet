@@ -122,6 +122,13 @@ class TrainConfig:
     loss_ssi_weight: float = 0.0
     loss_grad_weight: float = 0.0
     loss_ssi_eps: float = 0.05
+    # hybrid loss: L = alpha * L1 + (1 - alpha) * (1 - SSIM), both group-balanced; L1 in
+    # scaled target units, SSIM (taxelnet.ssim_loss) on raw-TC maps with this window and
+    # data range (TC, = eval.ssim_data_range). 1.0 = L1 only (default). The terms above
+    # are added on top.
+    loss_l1_ssim_alpha: float = 1.0
+    loss_ssim_window: tuple[int, int] = (2, 2)
+    loss_ssim_data_range: float = 3600.0
     # warm start (fine-tuning): run bundle whose model.pt weights initialise the model
     # (same architecture) and whose input scaler (x_center, x_scale) is reused, so the
     # input means the same as in pre-training; the target scaler is refitted on this

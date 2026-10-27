@@ -159,6 +159,10 @@ def suggest_configs(trial: optuna.trial.BaseTrial, base: HPOConfigs) -> HPOConfi
     t.loss_ssi_weight = trial.suggest_categorical(
         "loss_ssi_weight", [0.0, 0.1, 0.3, 1.0]
     )
+    # alpha * L1 + (1 - alpha) * (1 - SSIM), SSIM window = the objective's
+    t.loss_l1_ssim_alpha = trial.suggest_float("loss_l1_ssim_alpha", 0.0, 1.0)
+    t.loss_ssim_window = cfgs.hpo.ssim_window
+    t.loss_ssim_data_range = cfgs.eval.ssim_data_range
     t.scheduler = "cosine"
     p.target_group_key = trial.suggest_categorical(
         "target_group_key", ["none", "sensor"]

@@ -54,6 +54,7 @@ def test_suggest_configs_builds_a_standard_cnn(taxel_convs):
         "weight_decay": 1e-4,
         "groups_per_batch": 32,
         "loss_ssi_weight": 0.3,
+        "loss_l1_ssim_alpha": 0.4,
         "target_group_key": "sensor",
     }
     if taxel_convs:
@@ -64,6 +65,9 @@ def test_suggest_configs_builds_a_standard_cnn(taxel_convs):
     assert cfgs.model.name == "cnn_v0" and cfgs.model.input_features == "z"
     assert cfgs.model.taxel_channels == (32 if taxel_convs else 0)
     assert cfgs.train.loss_ssi_weight == 0.3
+    assert cfgs.train.loss_l1_ssim_alpha == 0.4
+    assert cfgs.train.loss_ssim_window == base.hpo.ssim_window
+    assert cfgs.train.loss_ssim_data_range == base.eval.ssim_data_range
     assert cfgs.preprocessing.target_group_key == "sensor"
     assert base.model.base_channels == 16  # base left untouched
     out = build_model(cfgs.model, (7, 4))(torch.zeros(2, 1, 77, 49))
