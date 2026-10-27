@@ -6,14 +6,13 @@ app = marimo.App(width="columns")
 
 @app.cell(column=0)
 def _(keys_df, mo, pl):
-    mo.md(
-        f"""
-        - key pairs: **{keys_df.height}**
-        - key pairs with several real rows: **{keys_df.filter(pl.col("n_real") > 1).height}**
-        - key pairs spanning several datasets: **{keys_df.filter(pl.col("n_dataset") > 1).height}**
-        - key pairs whose simulation rows differ: **{keys_df.filter(pl.col("n_distinct_sim") > 1).height}**
-        """
-    )
+    mo.md(f"""
+    - key pairs: **{keys_df.height}**
+    - key pairs with several real rows: **{keys_df.filter(pl.col("n_real") > 1).height}**
+    - key pairs spanning several datasets: **{keys_df.filter(pl.col("n_dataset") > 1).height}**
+    - key pairs whose simulation rows differ: **{keys_df.filter(pl.col("n_distinct_sim") > 1).height}**
+    """)
+    return
 
 
 @app.cell
@@ -111,6 +110,7 @@ def _(
         f" - distinct sim rows: {key['n_distinct_sim']}"
     )
     fig
+    return
 
 
 @app.cell(column=1)
@@ -156,6 +156,7 @@ def _():
 @app.cell
 def _(META_COLS, REAL_CSV, SIM_CSV, mo, read_matched_csv):
     data_dir = mo.notebook_dir().parent / "data" / "newton" / "v1" / "training"
+    # REAL_CSV2 = "Dataset_Grasp_Real_qtac100.csv"
     real_df = read_matched_csv(data_dir / REAL_CSV)
     sim_df = read_matched_csv(data_dir / SIM_CSV)
     NODE_COLS = [c for c in sim_df.columns if c not in META_COLS]  # n195 ... n14899
