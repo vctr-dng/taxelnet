@@ -22,6 +22,7 @@ from torch import nn
 from torch.optim import Optimizer
 
 from taxelnet import amp, artifacts
+from taxelnet.calibration import unseen_pad_metrics
 from taxelnet.checkpoint import (
     ARTIFACT_CONTRACT_VERSION,
     load_checkpoint,
@@ -29,7 +30,7 @@ from taxelnet.checkpoint import (
     save_checkpoint,
     save_model,
 )
-from taxelnet.config import Configs, TrainConfig
+from taxelnet.config import Configs, TrackingConfig, TrainConfig
 from taxelnet.dataset import (
     GroupBatchSampler,
     PairedData,
@@ -37,7 +38,6 @@ from taxelnet.dataset import (
     load_paired,
     load_test_paired,
 )
-from taxelnet.calibration import unseen_pad_metrics
 from taxelnet.evaluation import (
     compute_metrics,
     global_ssim,
@@ -55,9 +55,10 @@ from taxelnet.plots import (
     select_plot_samples,
 )
 from taxelnet.preprocessing import Preprocessor
-from taxelnet.ssi import ssi_losses
 from taxelnet.saturation import head_bounds
 from taxelnet.splits import PARTITIONS, TEST, make_split, shared_keys, split_manifest
+from taxelnet.ssi import ssi_losses
+from taxelnet.ssim_loss import windowed_ssim
 
 Logger = Callable[[dict[str, float], int], object]
 # called with (epoch, model, checkpoint path) after each periodic checkpoint
@@ -107,13 +108,18 @@ def train_one_epoch(
     ssi_eps: float = 0.05,
     logamp_weight: float = 0.0,
     logamp_eps: float = 50.0,
+    l1_ssim_alpha: float = 1.0,
+    ssim_window: tuple[int, int] = (2, 2),
+    ssim_data_range: float = 3600.0,
 ) -> dict[str, float]:
     """Group-balanced loss (scaled target space), averaged over the epoch's groups.
 
     Optional terms: `residual_l1_weight` times the mean |model.residual| (hybrid models
     only); the ssi / grad pattern terms (taxelnet.ssi); the group-balanced log-amplitude
-    term computed in raw TC (`taxelnet.amp.logamp_per_press`, needs `pre`). Returns the
-    epoch mean of each term: l1, residual / ssi / grad / logamp (when enabled), total.
+    term computed in raw TC (`taxelnet.amp.logamp_per_press`, needs `pre`). With
+    `l1_ssim_alpha` < 1 the anchor is alpha * L1 + (1 - alpha) * (1 - SSIM), SSIM on
+    raw-TC maps (taxelnet.ssim_loss, needs `pre`). Returns the epoch mean of each term:
+    l1, dssim (= 1 - SSIM) / residual / ssi / grad / logamp (when enabled), total.
     """
     model.train()
     totals: dict[str, float] = {}
@@ -124,6 +130,17 @@ def train_one_epoch(
         pred = model(x)
         terms = {"l1": group_balanced_l1(pred, y, group, alpha)}
         loss = terms["l1"]
+        if l1_ssim_alpha < 1:
+            assert pre is not None
+            sensor = None if ds.sensor is None else ds.sensor[batch]
+            ssim = windowed_ssim(
+                pre.inverse_y(pred, clamp=False, group=sensor),
+                pre.inverse_y(y, group=sensor),
+                ssim_data_range,
+                ssim_window,
+            )
+            terms["dssim"] = group_mean(1 - ssim, group, alpha)
+            loss = l1_ssim_alpha * loss + (1 - l1_ssim_alpha) * terms["dssim"]
         if residual_l1_weight > 0:
             terms["residual"] = model.residual.abs().mean()
             loss = loss + residual_l1_weight * terms["residual"]
@@ -223,6 +240,9 @@ def fit(
             ssi_eps=train_cfg.loss_ssi_eps,
             logamp_weight=train_cfg.loss_logamp_weight,
             logamp_eps=train_cfg.loss_logamp_eps,
+            l1_ssim_alpha=train_cfg.loss_l1_ssim_alpha,
+            ssim_window=train_cfg.loss_ssim_window,
+            ssim_data_range=train_cfg.loss_ssim_data_range,
         )  # fmt: skip
         if scheduler is not None:
             scheduler.step()
@@ -283,6 +303,21 @@ def _seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
 
 
+def setup_mlflow(tracking: TrackingConfig) -> None:
+    """Point MLflow at the tracking URI and select (creating if needed) the experiment."""
+    mlflow.set_tracking_uri(tracking.resolved_uri())
+    if mlflow.get_experiment_by_name(tracking.experiment) is None:
+        try:
+            mlflow.create_experiment(
+                tracking.experiment, artifact_location=tracking.artifact_location
+            )
+        except mlflow.exceptions.MlflowException:
+            # a concurrent run created it first
+            if mlflow.get_experiment_by_name(tracking.experiment) is None:
+                raise
+    mlflow.set_experiment(tracking.experiment)
+
+
 def run_training(cfgs: Configs) -> RunResult:
     """Training data -> train/val split -> train-only preprocessing -> fit -> evaluation
     on the external test pair -> bundle, all tracked in one MLflow run."""
@@ -325,7 +360,9 @@ def run_training(cfgs: Configs) -> RunResult:
         print(f"init_from {init_from}: input scaler x_scale={pre.x_scale:.4f} reused")
     if cfgs.preprocessing.target_group_key != "none":
         if cfgs.train.loss_logamp_weight > 0:
-            raise ValueError("loss_logamp_weight is not supported with target_group_key")
+            raise ValueError(
+                "loss_logamp_weight is not supported with target_group_key"
+            )
         print(f"per-group target scalers: {pre.group_labels}")
     device = cfgs.train.device
     # partition -> (paired data, rows): train/val from the training pair, test external
@@ -367,18 +404,7 @@ def run_training(cfgs: Configs) -> RunResult:
     run_dir = cfgs.train.output_dir / f"{time.strftime('%Y%m%d-%H%M%S')}_{run_name}"
     run_dir.mkdir(parents=True, exist_ok=False)
 
-    mlflow.set_tracking_uri(cfgs.tracking.resolved_uri())
-    if mlflow.get_experiment_by_name(cfgs.tracking.experiment) is None:
-        try:
-            mlflow.create_experiment(
-                cfgs.tracking.experiment,
-                artifact_location=cfgs.tracking.artifact_location,
-            )
-        except mlflow.exceptions.MlflowException:
-            # a concurrent run created it first
-            if mlflow.get_experiment_by_name(cfgs.tracking.experiment) is None:
-                raise
-    mlflow.set_experiment(cfgs.tracking.experiment)
+    setup_mlflow(cfgs.tracking)
 
     with mlflow.start_run(run_name=run_name) as run:
         run_id = run.info.run_id
@@ -390,6 +416,7 @@ def run_training(cfgs: Configs) -> RunResult:
                 "model.architecture": repr(model).replace("\n", " "),
                 "train.optimizer": "AdamW",
                 "train.loss": "group_balanced_l1"
+                + ("+ssim" if cfgs.train.loss_l1_ssim_alpha < 1 else "")
                 + ("+residual_l1" if cfgs.train.residual_l1_weight > 0 else "")
                 + ("+ssi" if cfgs.train.loss_ssi_weight > 0 else "")
                 + ("+grad" if cfgs.train.loss_grad_weight > 0 else "")
@@ -465,7 +492,10 @@ def run_training(cfgs: Configs) -> RunResult:
 
         # training-pad y_scale per test pad label (global_scale only: a pure division)
         train_scale = None
-        if test.sensor is not None and cfgs.preprocessing.target_scaler == "global_scale":
+        if (
+            test.sensor is not None
+            and cfgs.preprocessing.target_scaler == "global_scale"
+        ):
             if pre.group_labels:
                 train_scale = {
                     g: float(s) for g, s in zip(pre.group_labels, pre.y_scale)

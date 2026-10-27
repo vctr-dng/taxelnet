@@ -5,14 +5,17 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import torch
-from _helpers import ROWS, write_pair
+from _helpers import ROWS, write_grasp_pair, write_pair
 
 from taxelnet.config import DataConfig
 from taxelnet.dataset import (
     GroupBatchSampler,
     TaxelDataset,
+    drop_names,
     load_paired,
+    load_paired_files,
     load_test_paired,
+    read_blacklist,
 )
 
 
@@ -113,3 +116,34 @@ def test_sensor_labels_from_key_suffix():
     out = sensor_labels(groups, np.array([1, 0, 0]))
     assert out.tolist() == ["S2", "S1", "S1"]
     assert sensor_labels([{"path": "CircleG/Center"}], np.array([0])) is None
+
+
+def test_drop_names_removes_rows_and_reindexes_groups(tmp_path):
+    real_csv, sim_csv = write_grasp_pair(tmp_path, n=6, pads=("S1", "S2"))
+    paired = load_paired_files(real_csv, sim_csv, ["force", "Name"])
+    blacklist = tmp_path / "flagged.csv"
+    blacklist.write_text(
+        "row_in_csv,Name,sensor\n3,Sphere_TestG_20_1_S2,S2\n6,Sphere_TestG_235_4_S1,S1\n"
+    )
+    names = read_blacklist(blacklist)
+    assert names == {"Sphere_TestG_20_1_S2", "Sphere_TestG_235_4_S1"}
+
+    kept, n = drop_names(paired, names)
+    assert n == 2 and len(kept.group) == 4
+    assert kept.source_rows.tolist() == [0, 2, 3, 5]
+    assert sorted(kept.group.tolist()) == [0, 1, 2, 3]  # dense group ids
+    assert {kept.groups[g]["path"] for g in kept.group}.isdisjoint(names)
+    np.testing.assert_array_equal(kept.y, paired.y[[0, 2, 3, 5]])
+    np.testing.assert_array_equal(kept.x, paired.x[[0, 2, 3, 5]])
+    assert kept.sensor is not None
+    assert kept.sensor.tolist() == ["S1", "S1", "S2", "S2"]
+    for g, row in zip(kept.group, kept.source_rows):
+        assert kept.groups[g]["real_id"] == [row]
+
+
+def test_drop_names_strict_requires_every_name(tmp_path):
+    paired = load_paired_files(*write_grasp_pair(tmp_path, n=4), ["force", "Name"])
+    with pytest.raises(ValueError, match="blacklisted names not in"):
+        drop_names(paired, {"Unknown_S1"})
+    kept, n = drop_names(paired, {"Unknown_S1"}, strict=False)
+    assert n == 0 and len(kept.group) == 4

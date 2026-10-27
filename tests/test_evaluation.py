@@ -7,9 +7,12 @@ import pytest
 
 from taxelnet.evaluation import (
     compute_metrics,
+    cosine_similarity,
     global_ssim,
     object_metrics,
+    pearson,
     reference_points,
+    windowed_ssim,
 )
 
 
@@ -111,3 +114,54 @@ def test_object_metrics_groups_and_nocyl():
     assert m["nocyl_macro_mae"] == pytest.approx(3.5)
     assert m["reference"]["nocyl_macro_mae"] == pytest.approx(35.0)
     assert m["reference"]["group_Cuboid_TestXS_20_mae"] == pytest.approx(40.0)
+
+
+def test_windowed_ssim_perfect_and_full_window_equals_global():
+    rng = np.random.default_rng(0)
+    target = rng.normal(500, 300, (5, 7, 4))
+    pred = target + rng.normal(0, 100, target.shape)
+    assert windowed_ssim(target, target, 3600.0) == pytest.approx(np.ones(5))
+    np.testing.assert_allclose(
+        windowed_ssim(pred, target, 3600.0, window=(7, 4)),
+        global_ssim(pred, target, 3600.0),
+    )
+
+
+def test_windowed_ssim_hand_computed_2x2():
+    # 2 x 2 map = a single window; population statistics over its 4 taxels
+    pred = np.array([[[0.0, 2.0], [4.0, 6.0]]])
+    target = np.array([[[1.0, 1.0], [5.0, 5.0]]])
+    L = 10.0
+    c1, c2 = (0.01 * L) ** 2, (0.03 * L) ** 2
+    mp, mt, vp, vt, cov = 3.0, 3.0, 5.0, 4.0, 4.0
+    expected = ((2 * mp * mt + c1) * (2 * cov + c2)) / (
+        (mp**2 + mt**2 + c1) * (vp + vt + c2)
+    )
+    assert windowed_ssim(pred, target, L)[0] == pytest.approx(expected)
+
+
+def test_windowed_ssim_averages_the_6x3_patches():
+    rng = np.random.default_rng(1)
+    pred, target = rng.random((1, 7, 4)) * 1000, rng.random((1, 7, 4)) * 1000
+    patches = [
+        global_ssim(
+            pred[:, i : i + 2, j : j + 2], target[:, i : i + 2, j : j + 2], 3600.0
+        )
+        for i in range(6)
+        for j in range(3)
+    ]
+    assert windowed_ssim(pred, target, 3600.0)[0] == pytest.approx(np.mean(patches))
+    with pytest.raises(ValueError, match="does not fit"):
+        windowed_ssim(pred, target, 3600.0, window=(8, 2))
+
+
+def test_pearson_and_cosine():
+    rng = np.random.default_rng(2)
+    target = rng.random((3, 7, 4)) * 1000
+    np.testing.assert_allclose(pearson(2 * target + 50, target), 1.0)
+    np.testing.assert_allclose(pearson(-target, target), -1.0)
+    assert pearson(_maps([5.0]), target[:1])[0] == 0.0  # flat prediction
+    np.testing.assert_allclose(cosine_similarity(3 * target, target), 1.0)
+    a, b = np.zeros((1, 7, 4)), np.zeros((1, 7, 4))
+    a[0, 0, 0], b[0, 0, 1] = 1.0, 1.0
+    assert cosine_similarity(a, b)[0] == 0.0  # orthogonal maps

@@ -75,6 +75,54 @@ def global_ssim(pred: np.ndarray, target: np.ndarray, data_range: float) -> np.n
     )
 
 
+def windowed_ssim(
+    pred: np.ndarray,
+    target: np.ndarray,
+    data_range: float,
+    window: tuple[int, int] = (2, 2),
+) -> np.ndarray:
+    """Mean SSIM over every `window` patch (uniform weights, stride 1) of each map; (N,).
+
+    Same constants and population statistics as `global_ssim`, which is the special case
+    of a window covering the whole map. A 2 x 2 window on a 7 x 4 map has 6 x 3 patches.
+    """
+    wh, ww = window
+    h, w = pred.shape[-2:]
+    if not (1 <= wh <= h and 1 <= ww <= w):
+        raise ValueError(f"window {window} does not fit the {h} x {w} map")
+    view = np.lib.stride_tricks.sliding_window_view
+    # (N, h - wh + 1, w - ww + 1, wh * ww)
+    p = view(pred.astype(np.float64), window, axis=(-2, -1)).reshape(
+        len(pred), h - wh + 1, w - ww + 1, -1
+    )
+    t = view(target.astype(np.float64), window, axis=(-2, -1)).reshape(p.shape)
+    c1, c2 = (0.01 * data_range) ** 2, (0.03 * data_range) ** 2
+    mp, mt = p.mean(-1), t.mean(-1)
+    vp, vt = p.var(-1), t.var(-1)
+    cov = ((p - mp[..., None]) * (t - mt[..., None])).mean(-1)
+    ssim = ((2 * mp * mt + c1) * (2 * cov + c2)) / (
+        (mp**2 + mt**2 + c1) * (vp + vt + c2)
+    )
+    return ssim.mean((1, 2))
+
+
+def pearson(pred: np.ndarray, target: np.ndarray) -> np.ndarray:
+    """Pearson correlation over the taxels of each map; 0 when either map is flat. (N,)"""
+    p = pred.reshape(len(pred), -1).astype(np.float64)
+    t = target.reshape(len(target), -1).astype(np.float64)
+    pc, tc = p - p.mean(1, keepdims=True), t - t.mean(1, keepdims=True)
+    denom = np.sqrt((pc**2).sum(1) * (tc**2).sum(1))
+    return np.where(denom > 1e-12, (pc * tc).sum(1) / np.maximum(denom, 1e-12), 0.0)
+
+
+def cosine_similarity(pred: np.ndarray, target: np.ndarray) -> np.ndarray:
+    """Cosine of the angle between each predicted and real map (taxel vectors); (N,)."""
+    p = pred.reshape(len(pred), -1).astype(np.float64)
+    t = target.reshape(len(target), -1).astype(np.float64)
+    pn, tn = np.linalg.norm(p, axis=1), np.linalg.norm(t, axis=1)
+    return (p * t).sum(1) / np.maximum(pn * tn, 1e-12)
+
+
 CONTACT_THRESHOLD = 50.0  # TC: a taxel above this is "in contact" for contact_iou
 NORM_FLOOR = 1.0  # TC: map norms are floored at this in the amplitude log-ratio
 
@@ -101,8 +149,7 @@ def decomposed_metrics(
     m: dict[str, Any] = {}
 
     pn, tn = np.linalg.norm(p, axis=1), np.linalg.norm(t, axis=1)
-    cosine = (p * t).sum(1) / np.maximum(pn * tn, 1e-12)
-    m |= _median_iqr("cosine", cosine, group)
+    m |= _median_iqr("cosine", cosine_similarity(p, t), group)
     logratio = np.log(np.maximum(pn, NORM_FLOOR) / np.maximum(tn, NORM_FLOOR))
     m |= _median_iqr("amp_logratio", logratio, group)
 

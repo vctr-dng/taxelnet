@@ -16,6 +16,7 @@ dependencies = [
     "matplotlib>=3.11.2",
     "mlflow>=3.16.1",
     "numpy>=2.5.3",
+    "optuna>=5.0.0",
     "polars>=1.44.2",
     "torch>=2.14.1",
     "torchvision>=0.29.1",
