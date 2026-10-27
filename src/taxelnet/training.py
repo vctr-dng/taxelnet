@@ -21,7 +21,7 @@ import torch
 from torch import nn
 from torch.optim import Optimizer
 
-from taxelnet import artifacts
+from taxelnet import amp, artifacts
 from taxelnet.checkpoint import (
     ARTIFACT_CONTRACT_VERSION,
     load_checkpoint,
@@ -38,6 +38,7 @@ from taxelnet.dataset import (
 )
 from taxelnet.evaluation import (
     compute_metrics,
+    object_metrics,
     predict,
     predictions_frame,
     reference_points,
@@ -46,6 +47,8 @@ from taxelnet.io_csv import file_sha256
 from taxelnet.model import build_model
 from taxelnet.plots import save_inference_plots, select_plot_samples
 from taxelnet.preprocessing import Preprocessor
+from taxelnet.ssi import ssi_losses
+from taxelnet.saturation import head_bounds
 from taxelnet.splits import PARTITIONS, TEST, make_split, shared_keys, split_manifest
 
 Logger = Callable[[dict[str, float], int], object]
@@ -88,23 +91,57 @@ def train_one_epoch(
     sampler: GroupBatchSampler,
     optimizer: Optimizer,
     alpha: float = 0.0,
-) -> float:
-    """Group-balanced loss (scaled target space), averaged over the epoch's groups."""
+    pre: Preprocessor | None = None,
+    *,
+    residual_l1_weight: float = 0.0,
+    ssi_weight: float = 0.0,
+    grad_weight: float = 0.0,
+    ssi_eps: float = 0.05,
+    logamp_weight: float = 0.0,
+    logamp_eps: float = 50.0,
+) -> dict[str, float]:
+    """Group-balanced loss (scaled target space), averaged over the epoch's groups.
+
+    Optional terms: `residual_l1_weight` times the mean |model.residual| (hybrid models
+    only); the ssi / grad pattern terms (taxelnet.ssi); the group-balanced log-amplitude
+    term computed in raw TC (`taxelnet.amp.logamp_per_press`, needs `pre`). Returns the
+    epoch mean of each term: l1, residual / ssi / grad / logamp (when enabled), total.
+    """
     model.train()
-    total, n_groups = 0.0, 0
+    totals: dict[str, float] = {}
+    n_groups = 0
     for batch in sampler:
         idx = torch.as_tensor(batch, device=ds.x.device)
         x, y, group = ds.__getitems__(idx)
-        loss = group_balanced_l1(model(x), y, group, alpha)
+        pred = model(x)
+        terms = {"l1": group_balanced_l1(pred, y, group, alpha)}
+        loss = terms["l1"]
+        if residual_l1_weight > 0:
+            terms["residual"] = model.residual.abs().mean()
+            loss = loss + residual_l1_weight * terms["residual"]
+        if ssi_weight > 0 or grad_weight > 0:
+            l_ssi, l_grad = ssi_losses(pred, y, ssi_eps)
+            terms["ssi"] = group_mean(l_ssi, group, alpha)
+            terms["grad"] = group_mean(l_grad, group, alpha)
+            loss = loss + ssi_weight * terms["ssi"] + grad_weight * terms["grad"]
+        if logamp_weight > 0:
+            assert pre is not None
+            per_press = amp.logamp_per_press(
+                pre.inverse_y(pred, clamp=False), pre.inverse_y(y), logamp_eps
+            )
+            terms["logamp"] = group_mean(per_press, group, alpha)
+            loss = loss + logamp_weight * terms["logamp"]
+        terms["total"] = loss
         if not torch.isfinite(loss):
             raise FloatingPointError(f"non-finite training loss {loss.item()}")
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
         k = len(torch.unique(group))
-        total += loss.item() * k
+        for name, v in terms.items():
+            totals[name] = totals.get(name, 0.0) + v.item() * k
         n_groups += k
-    return total / n_groups
+    return {name: v / n_groups for name, v in totals.items()}
 
 
 @torch.no_grad()
@@ -115,7 +152,10 @@ def evaluate_loss(
     model.eval()
     preds = torch.cat([model(ds.x[i : i + 1024]) for i in range(0, len(ds), 1024)])
     loss = group_balanced_l1(preds, ds.y, ds.group, alpha).item()
-    raw_err = (pre.inverse_y(preds) - pre.inverse_y(ds.y)).abs().flatten(1).mean(1)
+    raw_err = (
+        (pre.inverse_y(preds, group=ds.sensor) - pre.inverse_y(ds.y, group=ds.sensor))
+        .abs().flatten(1).mean(1)
+    )  # fmt: skip
     if not math.isfinite(loss):
         raise FloatingPointError(f"non-finite evaluation loss {loss}")
     return {
@@ -143,8 +183,15 @@ def fit(
     to `on_checkpoint`.
     """
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    params: list | object = model.parameters()
+    if train_cfg.physics_lr is not None and hasattr(model, "footprint"):
+        phys = {id(p) for p in model.footprint.parameters()}
+        params = [
+            {"params": [p for p in model.parameters() if id(p) not in phys]},
+            {"params": list(model.footprint.parameters()), "lr": train_cfg.physics_lr},
+        ]
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=train_cfg.lr, weight_decay=train_cfg.weight_decay
+        params, lr=train_cfg.lr, weight_decay=train_cfg.weight_decay
     )
     scheduler = (
         torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=train_cfg.epochs)
@@ -160,7 +207,15 @@ def fit(
 
     for epoch in range(1, train_cfg.epochs + 1):
         lr = optimizer.param_groups[0]["lr"]
-        train_one_epoch(model, train_ds, sampler, optimizer, alpha)
+        epoch_terms = train_one_epoch(
+            model, train_ds, sampler, optimizer, alpha, pre,
+            residual_l1_weight=train_cfg.residual_l1_weight,
+            ssi_weight=train_cfg.loss_ssi_weight,
+            grad_weight=train_cfg.loss_grad_weight,
+            ssi_eps=train_cfg.loss_ssi_eps,
+            logamp_weight=train_cfg.loss_logamp_weight,
+            logamp_eps=train_cfg.loss_logamp_eps,
+        )  # fmt: skip
         if scheduler is not None:
             scheduler.step()
         train_m = evaluate_loss(model, train_ds, pre, alpha)
@@ -182,6 +237,8 @@ def fit(
             logger(
                 {
                     **{f"train_{k}": v for k, v in train_m.items()},
+                    # running epoch means of the optimized terms (train_l1, ...)
+                    **{f"train_{k}": v for k, v in epoch_terms.items()},
                     **{f"val_{k}": v for k, v in val_m.items()},
                     "lr": lr,
                     "best_val_macro_mae": history.best_val_macro_mae,
@@ -239,10 +296,19 @@ def run_training(cfgs: Configs) -> RunResult:
     checksums = {f.name: file_sha256(f) for f in (*paired.files, *test.files)}
 
     split = make_split(paired, data)
+    if split.held_out_shapes:
+        print(f"held-out val shapes: {', '.join(split.held_out_shapes)}")
     train_rows = split.rows["train"]
     pre = Preprocessor.fit(
-        cfgs.preprocessing, paired.x[train_rows], paired.y[train_rows]
+        cfgs.preprocessing,
+        paired.x[train_rows],
+        paired.y[train_rows],
+        None if paired.sensor is None else paired.sensor[train_rows],
     )
+    if cfgs.preprocessing.target_group_key != "none":
+        if cfgs.train.loss_logamp_weight > 0:
+            raise ValueError("loss_logamp_weight is not supported with target_group_key")
+        print(f"per-group target scalers: {pre.group_labels}")
     device = cfgs.train.device
     # partition -> (paired data, rows): train/val from the training pair, test external
     sources: dict[str, tuple[PairedData, np.ndarray]] = {
@@ -256,6 +322,18 @@ def run_training(cfgs: Configs) -> RunResult:
     for p, (src, rows) in sources.items():
         print(f"{p}: {len(ds[p])} readings, {len(np.unique(src.group[rows]))} groups")
 
+    if cfgs.model.head_activation == "tanh_bounded":
+        lo, hi = head_bounds(
+            pre.transform_y(
+                paired.y[train_rows],
+                None if paired.sensor is None else paired.sensor[train_rows],
+            ),
+            cfgs.model.head_bound_margin,
+        )
+        if cfgs.model.head_lower is None:
+            cfgs.model.head_lower = lo
+        if cfgs.model.head_upper is None:
+            cfgs.model.head_upper = hi
     model = build_model(cfgs.model, paired.taxel_shape).to(device)
     out = model(ds["train"].x[:1])
     if tuple(out.shape[1:]) != paired.taxel_shape:
@@ -270,9 +348,15 @@ def run_training(cfgs: Configs) -> RunResult:
 
     mlflow.set_tracking_uri(cfgs.tracking.resolved_uri())
     if mlflow.get_experiment_by_name(cfgs.tracking.experiment) is None:
-        mlflow.create_experiment(
-            cfgs.tracking.experiment, artifact_location=cfgs.tracking.artifact_location
-        )
+        try:
+            mlflow.create_experiment(
+                cfgs.tracking.experiment,
+                artifact_location=cfgs.tracking.artifact_location,
+            )
+        except mlflow.exceptions.MlflowException:
+            # a concurrent run created it first
+            if mlflow.get_experiment_by_name(cfgs.tracking.experiment) is None:
+                raise
     mlflow.set_experiment(cfgs.tracking.experiment)
 
     with mlflow.start_run(run_name=run_name) as run:
@@ -284,7 +368,11 @@ def run_training(cfgs: Configs) -> RunResult:
                 "model.n_params": n_params,
                 "model.architecture": repr(model).replace("\n", " "),
                 "train.optimizer": "AdamW",
-                "train.loss": "group_balanced_l1",
+                "train.loss": "group_balanced_l1"
+                + ("+residual_l1" if cfgs.train.residual_l1_weight > 0 else "")
+                + ("+ssi" if cfgs.train.loss_ssi_weight > 0 else "")
+                + ("+grad" if cfgs.train.loss_grad_weight > 0 else "")
+                + ("+logamp" if cfgs.train.loss_logamp_weight > 0 else ""),
                 "train.device_name": (
                     torch.cuda.get_device_name(device)
                     if device.startswith("cuda")
@@ -296,6 +384,8 @@ def run_training(cfgs: Configs) -> RunResult:
                 **{
                     f"split.{p}_readings": len(rows) for p, (_, rows) in sources.items()
                 },
+                "split.held_out_shapes": ",".join(split.held_out_shapes) or "none",
+                "split.n_held_out_shapes": len(split.held_out_shapes),
                 "artifact_contract_version": ARTIFACT_CONTRACT_VERSION,
             }
         )
@@ -327,6 +417,7 @@ def run_training(cfgs: Configs) -> RunResult:
         artifacts.write_requirements_lock(run_dir / "requirements.lock.txt")
 
         test_target, test_group = test.y, test.group
+        test_names = [test.groups[g]["path"] for g in test_group]
         plot_pos = select_plot_samples(test_target, cfgs.eval.plot_samples)
         plot_titles = [
             "{path} @ {force:g} (row {row})".format(
@@ -341,6 +432,7 @@ def run_training(cfgs: Configs) -> RunResult:
             m = compute_metrics(
                 pred, test_target, test_group, cfgs.eval.ssim_data_range
             )
+            m |= object_metrics(pred, test_target, test_group, test_names)
             out = run_dir / "plots" / name
             save_inference_plots(
                 out, test.x, test_target, pred, m, plot_pos,
@@ -353,8 +445,24 @@ def run_training(cfgs: Configs) -> RunResult:
         def on_checkpoint(epoch: int, model: nn.Module, path: Path) -> None:
             # monitoring only: best.pt is selected on validation, never on test
             m = evaluate_test(model, f"epoch_{epoch:04d}", f"test, epoch {epoch}")
+            # decomposed val metrics at the same epochs (val_micro/macro_mae are
+            # already logged every epoch by fit)
+            vsrc, vrows = sources["val"]
+            vm = compute_metrics(
+                predict(model, ds["val"], pre),
+                vsrc.y[vrows],
+                vsrc.group[vrows],
+                cfgs.eval.ssim_data_range,
+            )
             mlflow.log_metrics(
-                {f"test_{k}": v for k, v in m.items() if isinstance(v, float)},
+                {
+                    **{f"test_{k}": v for k, v in m.items() if isinstance(v, float)},
+                    **{
+                        f"val_{k}": v
+                        for k, v in vm.items()
+                        if isinstance(v, float) and k not in ("micro_mae", "macro_mae")
+                    },
+                },
                 step=epoch,
             )
             mlflow.log_artifact(str(path), "checkpoints")
@@ -382,6 +490,9 @@ def run_training(cfgs: Configs) -> RunResult:
 
         load_checkpoint(run_dir / "best.pt", model, map_location=device)
         save_model(run_dir / "model.pt", model, cfgs.model, paired.taxel_shape)
+        if hasattr(model, "report"):  # physics models: learned params + footprint plot
+            phys = model.report(run_dir)
+            mlflow.log_metrics({f"final_phys_{k}": v for k, v in phys.items()})
         evaluate_test(model, "best", f"test, best model (epoch {history.best_epoch})")
 
         metrics: dict = {
@@ -397,6 +508,9 @@ def run_training(cfgs: Configs) -> RunResult:
             metrics[p] = compute_metrics(pred, target, group, cfgs.eval.ssim_data_range)
             metrics[p]["reference"] = reference_points(target, group)
             if p == TEST:
+                obj = object_metrics(pred, target, group, test_names)
+                metrics[p]["reference"]["trivial_zero"] |= obj.pop("reference")
+                metrics[p] |= obj
                 if len(pred) != len(test.group):
                     raise AssertionError("test predictions do not cover the test file")
                 predictions_frame(src, rows, p, pred).write_parquet(

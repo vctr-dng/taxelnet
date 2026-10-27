@@ -104,3 +104,12 @@ def test_group_batch_sampler_reshuffles_each_epoch():
     group = np.arange(50)
     sampler = GroupBatchSampler(group, groups_per_batch=10, seed=0)
     assert list(sampler) != list(sampler)
+
+
+def test_sensor_labels_from_key_suffix():
+    from taxelnet.dataset import sensor_labels
+
+    groups = [{"path": "Cuboid_G/20_A_S1"}, {"path": "Cuboid_G/20_A_S2"}]
+    out = sensor_labels(groups, np.array([1, 0, 0]))
+    assert out.tolist() == ["S2", "S1", "S1"]
+    assert sensor_labels([{"path": "CircleG/Center"}], np.array([0])) is None

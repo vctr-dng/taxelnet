@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -103,6 +104,8 @@ class PairedData:
     groups: list[dict]  # build_index records: force, path, dataset, sim_id, real_id
     files: tuple[Path, Path]  # (real_csv, sim_csv)
     n_sim_differ: int
+    # (N,) pad label "S1"/"S2" from the Path/Name suffix; None unless every row has one
+    sensor: np.ndarray | None = None
 
     @property
     def mesh_shape(self) -> tuple[int, int]:
@@ -115,6 +118,18 @@ class PairedData:
     @property
     def group_sizes(self) -> np.ndarray:
         return np.bincount(self.group, minlength=len(self.groups))
+
+
+SENSOR_SUFFIX = re.compile(r"_(S\d+)$")
+
+
+def sensor_labels(paired_groups: list[dict], group: np.ndarray) -> np.ndarray | None:
+    """Per-row pad label (`..._S1` / `..._S2` suffix of the key), None if any row lacks one."""
+    found = [SENSOR_SUFFIX.search(g["path"]) for g in paired_groups]
+    if not all(found):
+        return None
+    labels = np.array([m.group(1) for m in found])
+    return labels[group]
 
 
 def load_paired_files(
@@ -158,6 +173,7 @@ def load_paired_files(
         groups=groups,
         n_sim_differ=n_sim_differ,
         files=(real_csv, sim_csv),
+        sensor=sensor_labels(groups, group),
     )
 
 
@@ -185,7 +201,8 @@ class TaxelDataset(Dataset):
     """Rows of a partition with fitted transforms applied once, kept as tensors.
 
     Items are `(x (1, H_mesh, W_mesh), y (H_taxel, W_taxel), group)`; `y` is in the scaled
-    target space. `__getitems__` lets a DataLoader fetch a whole batch by tensor indexing.
+    target space. `self.sensor` holds the rows' pad labels (or None); when present,
+    `transform_y` is called as `transform_y(y, sensor)`. `__getitems__` lets a DataLoader fetch a whole batch by tensor indexing.
     """
 
     def __init__(
@@ -193,15 +210,16 @@ class TaxelDataset(Dataset):
         paired: PairedData,
         rows: np.ndarray,
         transform_x: Callable[[np.ndarray], np.ndarray] | None = None,
-        transform_y: Callable[[np.ndarray], np.ndarray] | None = None,
+        transform_y: Callable[..., np.ndarray] | None = None,
     ) -> None:
         self.rows = np.asarray(rows, dtype=np.int64)
+        self.sensor = None if paired.sensor is None else paired.sensor[self.rows]
         x = paired.x[self.rows]
         y = paired.y[self.rows]
         if transform_x is not None:
             x = transform_x(x)
         if transform_y is not None:
-            y = transform_y(y)
+            y = transform_y(y) if self.sensor is None else transform_y(y, self.sensor)
         self.x = torch.from_numpy(np.ascontiguousarray(x, dtype=np.float32)).unsqueeze(
             1
         )

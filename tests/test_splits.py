@@ -91,3 +91,43 @@ def test_split_manifest_records_every_group(paired_cfg, grasp_pair):
     assert set(manifest["test"]["files"]) == {"grasp_real.csv", "grasp_sim.csv"}
     shares = manifest["train_path_weight_share"].values()
     assert sum(s["loss_weight_share"] for s in shares) == pytest.approx(1.0)
+
+
+def test_allocate_random_order_does_not_overfill():
+    sizes = np.array([900, 2000, 50, 40, 30, 60, 20, 70, 10, 80, 15, 25])
+    for seed in range(5):
+        part = allocate_groups(
+            sizes, {"train": 0.9, "val": 0.1}, seed=seed, largest_first=False
+        )
+        val = sizes[part == "val"].sum()
+        assert 0 < val <= 0.1 * sizes.sum()
+
+
+def test_make_split_shape_holds_out_whole_shapes(paired_cfg, grasp_pair):
+    paired, cfg = paired_cfg
+    cfg.split_strategy = "shape"
+    cfg.val_ratio = 0.3
+    split = make_split(paired, cfg)
+
+    shapes = {
+        p: {paired.groups[g]["path"].split("/")[0] for g in paired.group[split.rows[p]]}
+        for p in PARTITIONS
+    }
+    assert shapes["train"].isdisjoint(shapes["val"])
+    assert shapes["val"] and set(split.held_out_shapes) == shapes["val"]
+    all_rows = np.concatenate([split.rows[p] for p in PARTITIONS])
+    assert sorted(all_rows.tolist()) == list(range(len(paired.group)))
+
+    test = load_paired_files(grasp_pair[0], grasp_pair[1], ["force", "Name"])
+    manifest = split_manifest(
+        paired, split, cfg, test, {f.name: "sha" for f in test.files}
+    )
+    assert manifest["config"]["split_strategy"] == "shape"
+    assert manifest["held_out_shapes"] == list(split.held_out_shapes)
+
+
+def test_make_split_rejects_unknown_strategy(paired_cfg):
+    paired, cfg = paired_cfg
+    cfg.split_strategy = "nope"
+    with pytest.raises(ValueError, match="split_strategy"):
+        make_split(paired, cfg)

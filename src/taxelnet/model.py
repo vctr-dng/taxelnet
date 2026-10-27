@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 from taxelnet.config import ModelConfig
+from taxelnet.heads import apply_output_head, init_output_head
 
 
 class CNNTaxelPredictor(nn.Module):
@@ -30,6 +31,10 @@ class CNNTaxelPredictor(nn.Module):
         taxel_shape: tuple[int, int],
         base_channels: int = 16,
         num_down_blocks: int = 3,
+        taxel_affine_head: bool = False,
+        head_activation: str = "linear",
+        head_lower: float | None = None,
+        head_upper: float | None = None,
     ) -> None:
         super().__init__()
         self.taxel_shape = taxel_shape
@@ -61,17 +66,42 @@ class CNNTaxelPredictor(nn.Module):
         # - per_taxel_zscore: per-taxel standardization. L1 then equals raw L1 weighted
         #   by 1 / sigma_t, so quiet taxels are up-weighted: a different estimand
         #   weighting, to be chosen deliberately.
+        # - asinh: y' = asinh(y / s), monotone, so L1 still estimates the raw-TC median
+        #   per taxel, but gradients are rebalanced (loud taxels compressed). The inverse
+        #   clamps y' to the train range so sinh cannot explode (taxelnet.amp).
         self.head = nn.Conv2d(in_channels, 1, kernel_size=1)
+        # optional output heads (taxelnet.heads): learned per-taxel gain/offset
+        # (plan C1, init identity) then the bounded tanh soft clip (experiment `sat`)
+        init_output_head(
+            self, taxel_shape, taxel_affine_head, head_activation, head_lower, head_upper
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, 1, H_mesh, W_mesh) -> returns (B, H_taxel, W_taxel)."""
         features = self.encoder(x)
         resized = self.resize(features)
-        out = self.head(resized)
-        return out.squeeze(1)
+        out = self.head(resized).squeeze(1)
+        return apply_output_head(self, out)
 
 
 MODELS = {"cnn_v0": CNNTaxelPredictor}
+
+# physics-structured readout (plan D1/D2), in its own module
+from taxelnet.model_physics import (  # noqa: E402
+    FootprintCNNTaxelPredictor,
+    FootprintTaxelPredictor,
+)
+
+MODELS |= {"footprint": FootprintTaxelPredictor, "footprint_cnn": FootprintCNNTaxelPredictor}
+
+
+def _register_extra_models() -> None:
+    from taxelnet.model_features import FeatureCNN
+
+    MODELS["cnn_feat"] = FeatureCNN
+
+
+_register_extra_models()
 
 
 def build_model(model_cfg: ModelConfig, taxel_shape: tuple[int, int]) -> nn.Module:
@@ -80,8 +110,25 @@ def build_model(model_cfg: ModelConfig, taxel_shape: tuple[int, int]) -> nn.Modu
         raise ValueError(
             f"unknown model {model_cfg.name!r}, expected one of {list(MODELS)}"
         )
+    kwargs: dict[str, object] = {}
+    feat_kwargs = dict(
+        input_features=model_cfg.input_features,
+        convs_per_block=model_cfg.convs_per_block,
+        norm=model_cfg.norm,
+    )
+    if model_cfg.name == "cnn_feat":
+        kwargs = feat_kwargs
+    elif model_cfg.name == "footprint_cnn":
+        kwargs = dict(residual_backbone=model_cfg.residual_backbone, **feat_kwargs)
+    elif model_cfg.residual_backbone != "cnn_v0":
+        raise ValueError("model.residual_backbone only applies to footprint_cnn")
     return MODELS[model_cfg.name](
         taxel_shape=tuple(taxel_shape),
         base_channels=model_cfg.base_channels,
         num_down_blocks=model_cfg.num_down_blocks,
+        taxel_affine_head=model_cfg.taxel_affine_head,
+        head_activation=model_cfg.head_activation,
+        head_lower=model_cfg.head_lower,
+        head_upper=model_cfg.head_upper,
+        **kwargs,
     )
