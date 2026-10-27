@@ -209,10 +209,56 @@ def _parser_for(annotation: Any):
     return parse
 
 
-def build_arg_parser() -> argparse.ArgumentParser:
+@dataclass
+class HPOConfig:
+    # grasp names (`Name` column) removed from every pair; strict on the training pair
+    blacklist_csv: Path | None = Path(
+        "data/newton/v1/training/flagged_grasp_high_readings.csv"
+    )
+    # validation pair: what the study optimizes (data.test_* is the held-out test pair)
+    val_dir: Path = Path("data/newton/v1/test")
+    val_real_csv: str = "Dataset_Grasp_Real_qtac100_testing.csv"
+    val_sim_csv: str = "Dataset_Grasp_Simulation_qtac100_testing.csv"
+    val_key_cols: tuple[str, str] = ("force", "Name")
+    study_name: str = "taxelnet-hpo"
+    storage: str = "sqlite:///outputs/hpo/optuna.db"
+    n_trials: int = 100
+    timeout: float | None = None  # seconds, per worker
+    sampler: str = "tpe"  # tpe | nsga2
+    sampler_seed: int = 0
+    seeds_per_trial: int = 1  # objectives are averaged over train.seed + 0..n-1
+    # one L1 gain per pad label, fitted on all readings of the scored pair, applied
+    # before MAE and SSIM (the val/test pads are not the training pads)
+    calibrate: bool = True
+    ssim_window: tuple[int, int] = (2, 2)
+    output_dir: Path = Path("outputs/hpo")
+    report_only: bool = False  # skip optimization, rewrite the study report
+
+
+@dataclass
+class HPOConfigs(Configs):
+    """Configs of an Optuna study: grasp training pair, testing files as val/test."""
+
+    data: DataConfig = field(
+        default_factory=lambda: DataConfig(
+            real_csv="Dataset_Grasp_Real_qtac100.csv",
+            sim_csv="Dataset_Grasp_Simulation_qtac100.csv",
+            key_cols=("force", "Name"),
+        )
+    )
+    train: TrainConfig = field(
+        default_factory=lambda: TrainConfig(epochs=200, test_every=0)
+    )
+    tracking: TrackingConfig = field(
+        default_factory=lambda: TrackingConfig(experiment="taxelnet-hpo")
+    )
+    hpo: HPOConfig = field(default_factory=HPOConfig)
+
+
+def build_arg_parser(cls: type[Configs] = Configs) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train the Taxelnet V0 model.")
-    defaults = Configs()
-    for section in dataclasses.fields(Configs):
+    defaults = cls()
+    for section in dataclasses.fields(cls):
         cfg = getattr(defaults, section.name)
         hints = typing.get_type_hints(type(cfg))
         for f in dataclasses.fields(cfg):
@@ -226,9 +272,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def parse_configs(argv: list[str] | None = None) -> Configs:
-    args = vars(build_arg_parser().parse_args(argv))
-    cfgs = Configs()
+def parse_configs(
+    argv: list[str] | None = None, cls: type[Configs] = Configs
+) -> Configs:
+    args = vars(build_arg_parser(cls).parse_args(argv))
+    cfgs = cls()
     for dotted, value in args.items():
         section, name = dotted.split(".", 1)
         setattr(getattr(cfgs, section), name, value)
