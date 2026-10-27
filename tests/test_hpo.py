@@ -15,8 +15,11 @@ from _helpers import write_grasp_pair
 from taxelnet.config import HPOConfigs, parse_configs
 from taxelnet.hpo import (
     OBJECTIVES,
+    calibrate_pads,
+    group_objectives,
     load_hpo_data,
     objective_metrics,
+    reading_objectives,
     run_study,
     suggest_configs,
 )
@@ -41,6 +44,28 @@ def test_objective_metrics_calibrates_each_pad():
     raw = objective_metrics(pred, target, pads, 3600.0, calibrate=False)
     assert raw["mae"] == pytest.approx(m["raw_mae"])
     assert "gain_S1" not in raw
+
+
+def test_group_objectives_match_the_whole_set_and_each_group():
+    rng = np.random.default_rng(1)
+    target = rng.random((8, 7, 4)) * 1000 + 10
+    pred = target * rng.uniform(0.5, 1.5, (8, 1, 1))
+    pads = np.array(["S1"] * 5 + ["S2"] * 3)
+    labels = np.array(["Sphere_TestG_20_S1"] * 5 + ["Cylinder_TestButtons_235_S2"] * 3)
+    cal, gains = calibrate_pads(pred, target, pads)
+    per_reading = reading_objectives(cal, pred, target, 3600.0)
+
+    by_group = group_objectives(per_reading, labels)
+
+    assert list(by_group) == ["all", *sorted(set(labels))]
+    whole = objective_metrics(pred, target, pads, 3600.0)
+    for k, v in by_group["all"].items():
+        assert v == pytest.approx(whole[k])
+    sel = labels == "Sphere_TestG_20_S1"
+    assert by_group["Sphere_TestG_20_S1"]["mae"] == pytest.approx(
+        np.abs(cal[sel] - target[sel]).mean()
+    )
+    assert set(gains) == {"gain_S1", "gain_S2"}
 
 
 @pytest.mark.parametrize("taxel_convs", [0, 2])

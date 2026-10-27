@@ -103,6 +103,49 @@ def load_hpo_data(cfgs: HPOConfigs) -> HPOData:
     return HPOData(train, val, test, dropped)
 
 
+def calibrate_pads(
+    pred: np.ndarray,
+    target: np.ndarray,
+    pads: np.ndarray | None,
+    calibrate: bool = True,
+) -> tuple[np.ndarray, dict[str, float]]:
+    """Predictions (float64) with each pad's exact L1 gain applied, and the gains.
+
+    `pads` (N,) is each reading's pad label; None = one pad. Without `calibrate`, the
+    predictions are returned unchanged and there are no gains.
+    """
+    labels = np.full(len(pred), "all") if pads is None else np.asarray(pads).astype(str)
+    cal = pred.astype(np.float64)
+    gains: dict[str, float] = {}
+    if calibrate:
+        cal = cal.copy()
+        for q in sorted(set(labels)):
+            sel = labels == q
+            gain = float(fit_global_gain(pred[sel], target[sel]).gain)
+            cal[sel] *= gain
+            gains[f"gain_{q}"] = gain
+    return cal, gains
+
+
+def reading_objectives(
+    cal: np.ndarray,
+    pred: np.ndarray,
+    target: np.ndarray,
+    data_range: float,
+    window: tuple[int, int] = (2, 2),
+) -> dict[str, np.ndarray]:
+    """Per-reading objectives (N,) of the calibrated `cal`, plus raw SSIM / MAE of `pred`."""
+    n = len(pred)
+    return {
+        "ssim": windowed_ssim(cal, target, data_range, window),
+        "pearson": pearson(cal, target),
+        "mae": np.abs(cal - target).reshape(n, -1).mean(1),
+        "cosine": cosine_similarity(cal, target),
+        "raw_ssim": windowed_ssim(pred, target, data_range, window),
+        "raw_mae": np.abs(pred.astype(np.float64) - target).reshape(n, -1).mean(1),
+    }
+
+
 def objective_metrics(
     pred: np.ndarray,
     target: np.ndarray,
@@ -116,24 +159,20 @@ def objective_metrics(
     `pads` (N,) is each reading's pad label; None = one pad. With `calibrate`, each pad's
     predictions are multiplied by the exact L1 gain fitted on all of its readings.
     """
-    labels = np.full(len(pred), "all") if pads is None else np.asarray(pads).astype(str)
-    cal = pred.astype(np.float64)
-    out: dict[str, float] = {}
-    if calibrate:
-        cal = cal.copy()
-        for q in sorted(set(labels)):
-            sel = labels == q
-            gain = float(fit_global_gain(pred[sel], target[sel]).gain)
-            cal[sel] *= gain
-            out[f"gain_{q}"] = gain
-    out |= {
-        "ssim": float(windowed_ssim(cal, target, data_range, window).mean()),
-        "pearson": float(pearson(cal, target).mean()),
-        "mae": float(np.abs(cal - target).mean()),
-        "cosine": float(cosine_similarity(cal, target).mean()),
-        "raw_ssim": float(windowed_ssim(pred, target, data_range, window).mean()),
-        "raw_mae": float(np.abs(pred.astype(np.float64) - target).mean()),
-    }
+    cal, gains = calibrate_pads(pred, target, pads, calibrate)
+    per_reading = reading_objectives(cal, pred, target, data_range, window)
+    return gains | {k: float(v.mean()) for k, v in per_reading.items()}
+
+
+def group_objectives(
+    per_reading: dict[str, np.ndarray], labels: np.ndarray
+) -> dict[str, dict[str, float]]:
+    """{"all": mean of each per-reading objective, <label>: mean over its readings}."""
+    labels = np.asarray(labels).astype(str)
+    out = {"all": {k: float(v.mean()) for k, v in per_reading.items()}}
+    for g in sorted(set(labels)):
+        sel = labels == g
+        out[g] = {k: float(v[sel].mean()) for k, v in per_reading.items()}
     return out
 
 
