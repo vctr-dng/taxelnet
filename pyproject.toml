@@ -11,12 +11,26 @@ authors = [
 ]
 requires-python = ">=3.13"
 dependencies = [
+    "ipykernel>=7.4.0",
     "marimo>=0.25.1",
+    "matplotlib>=3.11.2",
+    "mlflow>=3.16.1",
     "numpy>=2.5.3",
+    "polars>=1.44.2",
     "torch>=2.14.1",
     "torchvision>=0.29.1",
     "tqdm>=4.70.1",
 ]
+
+[tool.pyrefly]
+project-includes = [
+    "**/*.py*",
+    "**/*.ipynb",
+]
+search-path = ["src", "tests"]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/data_exploration.py" = ["B018"]
 
 [build-system]
 requires = ["uv_build>=0.12.22,<0.13.0"]
