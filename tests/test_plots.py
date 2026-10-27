@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import numpy as np
 
-from taxelnet.plots import plot_group_label, save_inference_plots, select_group_samples
+from taxelnet.plots import (
+    plot_group_label,
+    plot_learning_curves,
+    plot_metrics_by_group,
+    save_inference_plots,
+    select_group_samples,
+)
 
 
 def test_plot_group_label():
@@ -44,3 +50,37 @@ def test_save_inference_plots_per_group(tmp_path):
     assert (tmp_path / "samples" / "Sphere_TestG_20_S1.png").exists()
     assert (tmp_path / "samples" / "Cylinder_TestButtons_235_S2.png").exists()
     assert (tmp_path / "samples.png").exists()
+
+
+def _metric_values(n_seeds: int) -> dict:
+    rng = np.random.default_rng(0)
+    return {
+        g: {m: rng.uniform(size=n_seeds).tolist() for m in ("ssim", "mae")}
+        for g in ("all", "Sphere_TestG_20_S1", "Cuboid_TestXS_20_S1")
+    }
+
+
+def test_plot_metrics_by_group_dots_for_one_seed_violins_for_several():
+    from matplotlib.collections import PolyCollection
+
+    def n_violins(fig) -> int:
+        return sum(
+            isinstance(c, PolyCollection) for ax in fig.axes for c in ax.collections
+        )
+
+    one = plot_metrics_by_group(_metric_values(1), ["ssim", "mae"], {"mae": "TC"})
+    assert len(one.axes) == 2 and n_violins(one) == 0
+    three = plot_metrics_by_group(_metric_values(3), ["ssim", "mae"])
+    assert n_violins(three) == 2 * 3  # one body per group and metric
+    assert three.axes[0].get_xticklabels()[0].get_text() == "all"
+
+
+def test_plot_learning_curves(tmp_path):
+    curves = {
+        g: {"ssim": [0.1, 0.5, 0.6], "mae": [300.0, 120.0, 110.0]}
+        for g in ("all", "Sphere_TestG_20_S1")
+    }
+    bands = {g: {m: (v, v) for m, v in c.items()} for g, c in curves.items()}
+    fig = plot_learning_curves([1, 2, 3], curves, ["ssim", "mae"], 3, bands)
+    assert len(fig.axes) == 2 and len(fig.axes[0].lines) == 3  # 2 groups + best line
+    fig.savefig(tmp_path / "lc.png")

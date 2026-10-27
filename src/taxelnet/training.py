@@ -50,7 +50,8 @@ from taxelnet.evaluation import (
 from taxelnet.io_csv import file_sha256
 from taxelnet.model import build_model
 from taxelnet.plots import (
-    plot_group_label,
+    reading_group_labels,
+    reading_titles,
     save_inference_plots,
     select_plot_samples,
 )
@@ -467,27 +468,11 @@ def run_training(cfgs: Configs) -> RunResult:
         test_target, test_group = test.y, test.group
         test_names = [test.groups[g]["path"] for g in test_group]
 
-        def reading_titles(src: PairedData, rows: np.ndarray) -> list[str]:
-            return [
-                "{path} @ {force:g} (row {row})".format(
-                    **src.groups[src.group[r]], row=src.source_rows[r]
-                )
-                for r in rows
-            ]
-
-        def group_labels(src: PairedData, rows: np.ndarray) -> np.ndarray:
-            return np.array(
-                [
-                    plot_group_label(src.groups[g]["path"], src.groups[g]["force"])
-                    for g in src.group[rows]
-                ]
-            )
-
         plot_pos = select_plot_samples(test_target, cfgs.eval.plot_samples)
         plot_titles = reading_titles(test, plot_pos)
         test_rows = np.arange(len(test_group))
         test_all_titles = reading_titles(test, test_rows)
-        test_labels = group_labels(test, test_rows)
+        test_labels = reading_group_labels(test, test_rows)
         test_objects = np.array([object_group(s) for s in test_names])
 
         # training-pad y_scale per test pad label (global_scale only: a pure division)
@@ -598,7 +583,7 @@ def run_training(cfgs: Configs) -> RunResult:
                 out, vsrc.x[vrows], vtarget, vpred, vm, vpos,
                 [vtitles[p] for p in vpos],
                 f"val, best model (epoch {history.best_epoch})",
-                group_labels=group_labels(vsrc, vrows),
+                group_labels=reading_group_labels(vsrc, vrows),
                 ssim=global_ssim(vpred, vtarget, cfgs.eval.ssim_data_range),
                 titles=vtitles, per_group=cfgs.eval.plot_samples_per_group,
             )  # fmt: skip

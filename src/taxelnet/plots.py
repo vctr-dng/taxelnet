@@ -1,4 +1,5 @@
-"""Inference plots for a checkpoint: sample maps, prediction scatter, per-taxel error.
+"""Inference plots for a checkpoint: sample maps, prediction scatter, per-taxel error;
+objectives by group (dots for one seed, violins over seeds) and their learning curves.
 
 Figures are built with the object-oriented matplotlib API (no pyplot), so importing this
 module never changes the global backend. Maps are drawn in pad coordinates: the vertical
@@ -8,12 +9,17 @@ axis is X (41.80 mm at the top, like tax1 / n195), the horizontal axis is Y.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 from matplotlib.figure import Figure
 
 from taxelnet.io_csv import X_MAX, X_MIN, Y_MAX, Y_MIN
+
+if TYPE_CHECKING:
+    from taxelnet.dataset import PairedData
 
 # imshow extent (left, right, bottom, top) in mm: row 0 at X_MAX, column 0 at Y_MAX
 PAD_EXTENT = (Y_MAX, Y_MIN, X_MIN, X_MAX)
@@ -42,6 +48,26 @@ def plot_group_label(name: str, force: float) -> str:
     if tokens[-1] in ("S1", "S2"):
         label += f"_{tokens[-1]}"
     return re.sub(r"[^A-Za-z0-9_.-]", "_", label)
+
+
+def reading_titles(src: PairedData, rows: np.ndarray) -> list[str]:
+    """`<path> @ <force> (row <csv row>)` for each of `rows`."""
+    return [
+        "{path} @ {force:g} (row {row})".format(
+            **src.groups[src.group[r]], row=src.source_rows[r]
+        )
+        for r in rows
+    ]
+
+
+def reading_group_labels(src: PairedData, rows: np.ndarray) -> np.ndarray:
+    """`plot_group_label` of each of `rows`."""
+    return np.array(
+        [
+            plot_group_label(src.groups[g]["path"], src.groups[g]["force"])
+            for g in src.group[rows]
+        ]
+    )
 
 
 def select_group_samples(
@@ -87,6 +113,86 @@ def plot_ssim_by_group(ssim: np.ndarray, labels: np.ndarray) -> Figure:
     ax.set_axisbelow(True)
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
+    return fig
+
+
+def plot_metrics_by_group(
+    values: Mapping[str, Mapping[str, Sequence[float]]],
+    metrics: Sequence[str],
+    units: Mapping[str, str] | None = None,
+) -> Figure:
+    """One panel per metric, one column per group (`values` order, "all" first).
+
+    `values[group][metric]` holds one value per seed: a dot when every group has a
+    single value, else a violin over the values with the values drawn on top.
+    """
+    groups = list(values)
+    violins = any(len(values[g][m]) > 1 for g in groups for m in metrics)
+    fig = Figure(
+        figsize=(max(7.0, 1.0 + 0.9 * len(groups) * len(metrics) / 2), 4.2),
+        layout="constrained",
+    )
+    axes = fig.subplots(1, len(metrics), squeeze=False)[0]
+    xs = np.arange(1, len(groups) + 1)
+    rng = np.random.default_rng(0)
+    for ax, metric in zip(axes, metrics):
+        data = [np.asarray(values[g][metric], dtype=float) for g in groups]
+        colors = ["#1f3a5f" if g == "all" else "#3b82c4" for g in groups]
+        if violins:
+            parts = ax.violinplot(data, xs, widths=0.7, showmedians=True)
+            for body, c in zip(parts["bodies"], colors):
+                body.set_facecolor(c)
+                body.set_alpha(0.3)
+            for x, d, c in zip(xs, data, colors):
+                jitter = rng.uniform(-0.08, 0.08, len(d))
+                ax.scatter(x + jitter, d, s=12, color=c, zorder=3, lw=0)
+        else:
+            ax.scatter(xs, [d[0] for d in data], s=36, c=colors, zorder=3)
+            for x, d in zip(xs, data):
+                ax.annotate(
+                    f"{d[0]:.3g}", (x, d[0]), xytext=(0, 6),
+                    textcoords="offset points", ha="center", fontsize=7,
+                )  # fmt: skip
+        ax.set_xticks(xs, groups, rotation=60, ha="right", fontsize=7)
+        unit = (units or {}).get(metric)
+        ax.set_title(f"{metric} ({unit})" if unit else metric, fontsize=9)
+        ax.grid(axis="y", color="#e5e7eb", lw=0.8)
+        ax.set_axisbelow(True)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+    return fig
+
+
+def plot_learning_curves(
+    epochs: Sequence[int],
+    curves: Mapping[str, Mapping[str, Sequence[float]]],
+    metrics: Sequence[str],
+    best_epoch: int | None = None,
+    bands: Mapping[str, Mapping[str, tuple[Sequence[float], Sequence[float]]]]
+    | None = None,
+) -> Figure:
+    """Each metric against epoch, one line per group (`curves[group][metric]`, "all" bold);
+    optional (low, high) `bands` per group and metric, dashed line at `best_epoch`."""
+    fig = Figure(figsize=(4.2 * len(metrics), 4.0), layout="constrained")
+    axes = fig.subplots(1, len(metrics), squeeze=False)[0]
+    x = np.asarray(epochs)
+    for ax, metric in zip(axes, metrics):
+        for k, (group, curve) in enumerate(curves.items()):
+            is_all = group == "all"
+            color = "#1f3a5f" if is_all else f"C{k}"
+            ax.plot(
+                x, curve[metric], marker="o", ms=3, color=color,
+                lw=2.2 if is_all else 1.2, label=group,
+            )  # fmt: skip
+            if bands is not None and group in bands:
+                lo, hi = bands[group][metric]
+                ax.fill_between(x, lo, hi, color=color, alpha=0.15, lw=0)
+        if best_epoch is not None:
+            ax.axvline(best_epoch, color="0.4", ls="--", lw=1)
+        ax.set_xlabel("epoch")
+        ax.set_title(metric, fontsize=9)
+        ax.grid(color="#e5e7eb", lw=0.8)
+    axes[-1].legend(fontsize=7, loc="best")
     return fig
 
 
@@ -222,6 +328,13 @@ def save_inference_plots(
             metrics["per_taxel_micro_mae"], target.shape[1:]
         ),
     }
+    return save_figures(out_dir, figures, title)
+
+
+def save_figures(
+    out_dir: Path, figures: Mapping[str, Figure], title: str
+) -> list[Path]:
+    """Write each figure to out_dir/<name> (subfolders created) with `title` on top."""
     paths = []
     for name, fig in figures.items():
         fig.suptitle(title)
