@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 
+import mlflow
 import numpy as np
 import optuna
 import polars as pl
@@ -169,3 +170,56 @@ def test_run_study_smoke(hpo_cfgs):
         assert (seed_dir / name).exists()
     study = json.loads((out / "study.json").read_text())
     assert study["readings"] == {"train": 23, "val": 12, "test": 12}
+
+
+def _val_groups() -> list[str]:
+    # write_grasp_pair: odd rows at 20 on S2, even rows at 235 on S1
+    return ["Sphere_TestG_20_S2", "Sphere_TestG_235_S1"]
+
+
+def test_run_study_writes_periodic_and_best_val_plots(hpo_cfgs):
+    hpo_cfgs.hpo.plot_every, hpo_cfgs.hpo.n_trials = 1, 1
+    run_study(hpo_cfgs)
+
+    seed_dir = hpo_cfgs.hpo.output_dir / "smoke" / "trial_0000" / "seed0"
+    for name in ("epoch_0001", "epoch_0002", "best"):
+        plots = seed_dir / "plots" / name
+        for f in ("metrics_by_group.png", "scatter.png", "ssim_by_group.png"):
+            assert (plots / f).exists(), plots / f
+        for g in _val_groups():
+            assert (plots / "groups" / g / "scatter.png").exists()
+            assert (plots / "samples" / f"{g}.png").exists()
+        metrics = json.loads((plots / "metrics.json").read_text())
+        assert list(metrics["groups"]) == ["all", *_val_groups()]
+    assert (seed_dir / "plots" / "learning_curves.png").exists()
+    history = pl.read_csv(seed_dir / "eval_history.csv")
+    assert history["epoch"].unique().sort().to_list() == [1, 2]
+    assert set(history["group"]) == {"all", *_val_groups()}
+    # only the best periodic checkpoint is kept, as best_cal.pt
+    assert (seed_dir / "best_cal.pt").exists()
+    assert not (seed_dir / "checkpoints").exists()
+
+    trials = pl.read_csv(hpo_cfgs.hpo.output_dir / "smoke" / "trials.csv")
+    run_id = trials["mlflow_run_id"][0]
+    run = mlflow.get_run(run_id)
+    assert run.data.params["optuna.trial_number"] == "0"
+    assert "optuna.trial_id" in run.data.params
+    assert "val_Sphere_TestG_20_S2_mae" in run.data.metrics
+    artifacts = {a.path for a in mlflow.artifacts.list_artifacts(run_id=run_id)}
+    assert {"plots", "eval_history.csv"} <= artifacts
+
+
+def test_run_study_violins_over_seeds(hpo_cfgs):
+    h = hpo_cfgs.hpo
+    h.plot_every, h.n_trials, h.seeds_per_trial = 1, 1, 2
+    run_study(hpo_cfgs)
+
+    trial_dir = h.output_dir / "smoke" / "trial_0000"
+    for name in ("epoch_0001/metrics_by_group.png", "best/metrics_by_group.png"):
+        assert (trial_dir / "plots" / name).exists()
+    assert (trial_dir / "plots" / "learning_curves.png").exists()
+    for seed in (0, 1):
+        assert (trial_dir / f"seed{seed}" / "plots" / "best" / "scatter.png").exists()
+    run_id = pl.read_csv(h.output_dir / "smoke" / "trials.csv")["mlflow_run_id"][0]
+    artifacts = {a.path for a in mlflow.artifacts.list_artifacts(run_id=run_id)}
+    assert {"plots", "s0", "s1"} <= artifacts

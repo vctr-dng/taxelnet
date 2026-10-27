@@ -14,6 +14,13 @@ in the trial's user attributes.
 
 The scored model is the last epoch (end of the cosine schedule): `fit` keeps best.pt on
 the raw val MAE alone, which would favour one objective over the others.
+
+Every `hpo.plot_every` epochs (and at the last one) each seed's model is evaluated on the
+whole val pair and on each (object, force, pad) group: objectives logged to MLflow as
+val_<group>_<objective>, plots in seed<k>/plots/epoch_<N>/. The evaluation with the best
+calibrated val MAE is kept (best_cal.pt) and re-plotted in seed<k>/plots/best/, with the
+learning curves and eval_history.csv. With several seeds, trial_<n>/plots/ holds the same
+objectives by group as violins over the seeds.
 """
 
 from __future__ import annotations
@@ -22,7 +29,7 @@ import copy
 import gc
 import math
 import warnings
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -35,7 +42,7 @@ from matplotlib.figure import Figure
 
 from taxelnet import artifacts
 from taxelnet.calibration import fit_global_gain
-from taxelnet.checkpoint import load_model, save_model
+from taxelnet.checkpoint import load_checkpoint, load_model, save_model
 from taxelnet.config import HPOConfigs
 from taxelnet.dataset import (
     PairedData,
@@ -47,12 +54,25 @@ from taxelnet.dataset import (
     read_blacklist,
 )
 from taxelnet.evaluation import (
+    compute_metrics,
     cosine_similarity,
+    global_ssim,
     pearson,
     predict,
     windowed_ssim,
 )
 from taxelnet.model import build_model
+from taxelnet.plots import (
+    plot_learning_curves,
+    plot_metrics_by_group,
+    plot_per_taxel_mae,
+    plot_scatter,
+    reading_group_labels,
+    reading_titles,
+    save_figures,
+    save_inference_plots,
+    select_plot_samples,
+)
 from taxelnet.preprocessing import Preprocessor
 from taxelnet.splits import shared_keys
 from taxelnet.training import _seed_everything, fit, setup_mlflow
@@ -214,13 +234,180 @@ def _study_dir(cfgs: HPOConfigs) -> Path:
     return cfgs.hpo.output_dir / cfgs.hpo.study_name
 
 
+ByGroup = dict[str, dict[str, float]]  # {"all" | group: {objective: value}}
+
+
+def _units(cfgs: HPOConfigs) -> dict[str, str]:
+    return {"mae": "TC, calibrated" if cfgs.hpo.calibrate else "TC"}
+
+
+def _seed_values(by_groups: list[ByGroup]) -> dict[str, dict[str, list[float]]]:
+    """{group: {objective: one value per seed}} from each seed's `ByGroup`."""
+    return {
+        g: {k: [b[g][k] for b in by_groups] for k in OBJECTIVES} for g in by_groups[0]
+    }
+
+
+@dataclass
+class SeedRecord:
+    """Periodic val evaluations of one seed: epoch -> objectives by group, and the best."""
+
+    history: dict[int, ByGroup] = field(default_factory=dict)
+    best_epoch: int = -1
+    best: ByGroup = field(default_factory=dict)
+
+
+class ValMonitor:
+    """`fit` checkpoint hook of one seed: calibrated val objectives on the whole val pair
+    and on each group, logged and plotted in plots/epoch_<N>/. Keeps the periodic
+    checkpoint of the best calibrated MAE and deletes the others."""
+
+    def __init__(
+        self,
+        cfgs: HPOConfigs,
+        val: PairedData,
+        val_ds: TaxelDataset,
+        pre: Preprocessor,
+        out_dir: Path,
+        prefix: str,
+    ) -> None:
+        self.cfgs, self.val, self.val_ds, self.pre = cfgs, val, val_ds, pre
+        # MLflow: metrics <prefix>val_<group>_<objective>, artifacts under <prefix>/
+        self.out_dir, self.prefix = out_dir, prefix
+        self.artifact_dir = prefix.rstrip("_")
+        rows = np.arange(len(val.group))
+        self.labels = reading_group_labels(val, rows)
+        self.titles = reading_titles(val, rows)
+        self.record = SeedRecord()
+        self.best_mae = math.inf
+        self.best_path: Path | None = None
+
+    def _artifact_path(self, *parts: str) -> str:
+        return "/".join([self.artifact_dir, *parts] if self.artifact_dir else parts)
+
+    def evaluate(self, model: torch.nn.Module) -> tuple[np.ndarray, ByGroup, dict]:
+        """Calibrated predictions, objectives by group, pad gains."""
+        hpo, val = self.cfgs.hpo, self.val
+        pred = predict(model, self.val_ds, self.pre)
+        cal, gains = calibrate_pads(pred, val.y, val.sensor, hpo.calibrate)
+        per_reading = reading_objectives(
+            cal, pred, val.y, self.cfgs.eval.ssim_data_range, hpo.ssim_window
+        )
+        return cal, group_objectives(per_reading, self.labels), gains
+
+    def write(
+        self, name: str, title: str, cal: np.ndarray, by_group: ByGroup, info: dict
+    ) -> None:
+        """plots/<name>/: objectives by group, inference plots on the whole val pair and
+        scatter / per-taxel MAE of each group, metrics.json; logged to MLflow."""
+        val, data_range = self.val, self.cfgs.eval.ssim_data_range
+        out = self.out_dir / "plots" / name
+        if self.cfgs.hpo.calibrate:
+            title += " (calibrated per pad)"
+        figures = {
+            "metrics_by_group.png": plot_metrics_by_group(
+                _seed_values([by_group]), OBJECTIVES, _units(self.cfgs)
+            )
+        }
+        for g in sorted(set(self.labels)):
+            sel = np.flatnonzero(self.labels == g)
+            m = compute_metrics(cal[sel], val.y[sel], val.group[sel], data_range)
+            figures[f"groups/{g}/scatter.png"] = plot_scatter(cal[sel], val.y[sel], m)
+            figures[f"groups/{g}/per_taxel_mae.png"] = plot_per_taxel_mae(
+                m["per_taxel_micro_mae"], val.taxel_shape
+            )
+        save_figures(out, figures, title)
+        pos = select_plot_samples(val.y, self.cfgs.eval.plot_samples)
+        save_inference_plots(
+            out, val.x, val.y, cal, compute_metrics(cal, val.y, val.group, data_range),
+            pos, [self.titles[p] for p in pos], title, group_labels=self.labels,
+            ssim=global_ssim(cal, val.y, data_range), titles=self.titles,
+            per_group=self.cfgs.eval.plot_samples_per_group,
+        )  # fmt: skip
+        artifacts.write_json(out / "metrics.json", {**info, "groups": by_group})
+        mlflow.log_artifacts(str(out), self._artifact_path("plots", name))
+
+    def __call__(self, epoch: int, model: torch.nn.Module, path: Path) -> None:
+        cal, by_group, gains = self.evaluate(model)
+        self.record.history[epoch] = by_group
+        self.write(
+            f"epoch_{epoch:04d}", f"val, epoch {epoch}", cal, by_group,
+            {"epoch": epoch, **gains},
+        )  # fmt: skip
+        mlflow.log_metrics(
+            {
+                f"{self.prefix}val_{g}_{k}": v
+                for g, d in by_group.items()
+                for k, v in d.items()
+            },
+            step=epoch,
+        )
+        if by_group["all"]["mae"] < self.best_mae:
+            if self.best_path is not None:
+                self.best_path.unlink()
+            self.best_mae, self.best_path = by_group["all"]["mae"], path
+            self.record.best_epoch = epoch
+        else:
+            path.unlink()
+
+    def finish(self, model: torch.nn.Module, last_epoch: int) -> SeedRecord:
+        """Load the best periodic checkpoint into `model` (kept as best_cal.pt), plot it
+        in plots/best/; eval_history.csv and plots/learning_curves.png. Without periodic
+        evaluations, `model` (the last epoch) is the best."""
+        if self.best_path is not None:
+            load_checkpoint(self.best_path, model, map_location=self.cfgs.train.device)
+            self.best_path.replace(self.out_dir / "best_cal.pt")
+            if not any(self.best_path.parent.iterdir()):
+                self.best_path.parent.rmdir()
+        else:
+            self.record.best_epoch = last_epoch
+        cal, self.record.best, gains = self.evaluate(model)
+        epoch = self.record.best_epoch
+        self.write(
+            "best", f"val, best epoch {epoch} by calibrated MAE", cal,
+            self.record.best, {"epoch": epoch, **gains},
+        )  # fmt: skip
+        history = self.record.history
+        if history:
+            epochs = sorted(history)
+            pl.DataFrame(
+                [
+                    {"epoch": e, "group": g, **d}
+                    for e in epochs
+                    for g, d in history[e].items()
+                ]
+            ).write_csv(self.out_dir / "eval_history.csv")
+            curves = {
+                g: {k: [history[e][g][k] for e in epochs] for k in OBJECTIVES}
+                for g in history[epochs[0]]
+            }
+            out = self.out_dir / "plots"
+            save_figures(
+                out,
+                {
+                    "learning_curves.png": plot_learning_curves(
+                        epochs, curves, OBJECTIVES, epoch
+                    )
+                },
+                "val objectives by group",
+            )
+            mlflow.log_artifact(
+                str(out / "learning_curves.png"), self._artifact_path("plots")
+            )
+            mlflow.log_artifact(
+                str(self.out_dir / "eval_history.csv"), self.artifact_dir or None
+            )
+        return self.record
+
+
 def _train_seed(
     cfgs: HPOConfigs, data: HPOData, seed: int, out_dir: Path, log_prefix: str
-) -> dict[str, Any]:
-    """Train one model on the whole training pair; save its bundle; val objectives."""
+) -> tuple[dict[str, Any], SeedRecord]:
+    """Train one model on the whole training pair; save its bundle; val objectives of the
+    last epoch, and the periodic evaluations by group."""
     _seed_everything(seed)
     train_cfg = copy.deepcopy(cfgs.train)
-    train_cfg.seed, train_cfg.test_every = seed, 0
+    train_cfg.seed, train_cfg.test_every = seed, cfgs.hpo.plot_every
     device = train_cfg.device
     pre = Preprocessor.fit(
         cfgs.preprocessing, data.train.x, data.train.y, data.train.sensor
@@ -233,6 +420,7 @@ def _train_seed(
     ).to(device)
     model = build_model(cfgs.model, data.train.taxel_shape).to(device)
     n_params = sum(p.numel() for p in model.parameters())
+    monitor = ValMonitor(cfgs, data.val, val_ds, pre, out_dir, log_prefix)
     try:
         fit(
             model,
@@ -244,6 +432,7 @@ def _train_seed(
             logger=lambda m, step: mlflow.log_metrics(
                 {f"{log_prefix}{k}": v for k, v in m.items()}, step=step
             ),
+            on_checkpoint=monitor,
         )
         pred = predict(model, val_ds, pre)
         metrics = objective_metrics(
@@ -257,12 +446,57 @@ def _train_seed(
         save_model(out_dir / "model.pt", model, cfgs.model, data.train.taxel_shape)
         pre.save(out_dir / "preprocessing.json")
         artifacts.write_json(out_dir / "val_metrics.json", metrics)
+        record = monitor.finish(model, train_cfg.epochs)  # loads the best weights
     finally:
-        del model, train_ds, val_ds
+        del model, train_ds, val_ds, monitor
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    return {**metrics, "n_params": n_params}
+    return {**metrics, "n_params": n_params}, record
+
+
+def _write_trial_plots(
+    cfgs: HPOConfigs, trial_dir: Path, records: list[SeedRecord]
+) -> None:
+    """trial_<n>/plots/: objectives by group as violins over the seeds at each periodic
+    epoch and at each seed's best epoch; learning curves (seed mean, min-max band)."""
+    n, units = len(records), _units(cfgs)
+    out = trial_dir / "plots"
+    epochs = sorted(set.intersection(*(set(r.history) for r in records)))
+    for e in epochs:
+        save_figures(
+            out / f"epoch_{e:04d}",
+            {
+                "metrics_by_group.png": plot_metrics_by_group(
+                    _seed_values([r.history[e] for r in records]), OBJECTIVES, units
+                )
+            },
+            f"val over {n} seeds, epoch {e}",
+        )
+    best_epochs = ", ".join(str(r.best_epoch) for r in records)
+    figures = {
+        "best/metrics_by_group.png": plot_metrics_by_group(
+            _seed_values([r.best for r in records]), OBJECTIVES, units
+        )
+    }
+    if epochs:
+        per_epoch = [_seed_values([r.history[e] for r in records]) for e in epochs]
+        stat = {
+            name: {
+                g: {k: [float(fn(v[g][k])) for v in per_epoch] for k in OBJECTIVES}
+                for g in per_epoch[0]
+            }
+            for name, fn in (("mean", np.mean), ("min", np.min), ("max", np.max))
+        }
+        bands = {
+            g: {k: (stat["min"][g][k], stat["max"][g][k]) for k in OBJECTIVES}
+            for g in per_epoch[0]
+        }
+        figures["learning_curves.png"] = plot_learning_curves(
+            epochs, stat["mean"], OBJECTIVES, bands=bands
+        )
+    save_figures(out, figures, f"val over {n} seeds (best epochs {best_epochs})")
+    mlflow.log_artifacts(str(out), "plots")
 
 
 def run_trial(
@@ -277,9 +511,16 @@ def run_trial(
     seeds = [cfgs.train.seed + k for k in range(n_seeds)]
 
     run_name = f"{cfgs.hpo.study_name}-t{trial.number:04d}"
-    with mlflow.start_run(run_name=run_name):
+    with mlflow.start_run(run_name=run_name) as run:
         mlflow.log_params(
-            cfgs.flat() | {f"trial.{k}": v for k, v in trial.params.items()}
+            cfgs.flat()
+            | {f"trial.{k}": v for k, v in trial.params.items()}
+            | {
+                "optuna.study": cfgs.hpo.study_name,
+                "optuna.trial_number": trial.number,
+                # unique over every study of the storage
+                "optuna.trial_id": trial._trial_id,
+            }
         )
         mlflow.set_tags(
             {
@@ -288,19 +529,23 @@ def run_trial(
                 "git.commit": artifacts.git_revision(Path(__file__).parent)["commit"],
             }
         )
-        per_seed = [
-            _train_seed(
+        trial.set_user_attr("mlflow_run_id", run.info.run_id)
+        per_seed, records = [], []
+        for seed in seeds:
+            metrics, record = _train_seed(
                 cfgs,
                 data,
                 seed,
                 trial_dir / f"seed{seed}",
                 f"s{seed}_" if n_seeds > 1 else "",
             )
-            for seed in seeds
-        ]
+            per_seed.append(metrics)
+            records.append(record)
         mean = {k: float(np.mean([m[k] for m in per_seed])) for k in per_seed[0]}
         mlflow.log_metrics({f"val_{k}": v for k, v in mean.items()})
         mlflow.log_artifact(str(trial_dir / "config.json"))
+        if n_seeds > 1:
+            _write_trial_plots(cfgs, trial_dir, records)
     for k, v in mean.items():
         if k not in OBJECTIVES:
             trial.set_user_attr(k, v)
@@ -409,6 +654,7 @@ def report(study: optuna.Study, data: HPOData, cfgs: HPOConfigs) -> pl.DataFrame
                 if k.startswith(("raw_", "gain_"))
             },
             "n_params": t.user_attrs.get("n_params"),
+            "mlflow_run_id": t.user_attrs.get("mlflow_run_id"),
             **t.params,
         }
         for t in complete

@@ -238,6 +238,12 @@ class HPOConfig:
     # before MAE and SSIM (the val/test pads are not the training pads)
     calibrate: bool = True
     ssim_window: tuple[int, int] = (2, 2)
+    # every N epochs (and at the last one): calibrated val objectives on the whole val
+    # pair and on each (object, force, pad) group, logged and plotted in
+    # seed<k>/plots/epoch_<N>/; the best calibrated MAE of these is re-plotted in
+    # plots/best/ (plots only: the objectives stay on the last epoch). About 17 PNGs per
+    # evaluation; 0 = only plots/best/, from the last epoch
+    plot_every: int = 10
     output_dir: Path = Path("outputs/hpo")
     report_only: bool = False  # skip optimization, rewrite the study report
 
