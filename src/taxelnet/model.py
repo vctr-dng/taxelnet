@@ -35,6 +35,8 @@ class CNNTaxelPredictor(nn.Module):
         head_activation: str = "linear",
         head_lower: float | None = None,
         head_upper: float | None = None,
+        taxel_convs: int = 0,
+        taxel_channels: int = 0,
     ) -> None:
         super().__init__()
         self.taxel_shape = taxel_shape
@@ -55,6 +57,17 @@ class CNNTaxelPredictor(nn.Module):
         self.encoder = nn.Sequential(*blocks)
 
         self.resize = nn.AdaptiveAvgPool2d(taxel_shape)
+        # optional 3x3 convs on the taxel-resolution map, so neighbouring taxels exchange
+        # information before the readout (zero padding at the pad border)
+        taxel_layers: list[nn.Module] = []
+        for _ in range(taxel_convs):
+            width = taxel_channels or in_channels
+            taxel_layers += [
+                nn.Conv2d(in_channels, width, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+            ]
+            in_channels = width
+        self.taxel_convs = nn.Sequential(*taxel_layers)
         # Linear head (no activation): baseline-corrected taxel values may be negative.
         # It predicts the target in the space set by PreprocessingConfig.target_scaler:
         # - identity: raw tactile counts. The loss is exactly raw-TC L1, but a head
@@ -79,7 +92,7 @@ class CNNTaxelPredictor(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, 1, H_mesh, W_mesh) -> returns (B, H_taxel, W_taxel)."""
         features = self.encoder(x)
-        resized = self.resize(features)
+        resized = self.taxel_convs(self.resize(features))
         out = self.head(resized).squeeze(1)
         return apply_output_head(self, out)
 
@@ -122,6 +135,12 @@ def build_model(model_cfg: ModelConfig, taxel_shape: tuple[int, int]) -> nn.Modu
         kwargs = dict(residual_backbone=model_cfg.residual_backbone, **feat_kwargs)
     elif model_cfg.residual_backbone != "cnn_v0":
         raise ValueError("model.residual_backbone only applies to footprint_cnn")
+    if model_cfg.name == "cnn_v0":
+        kwargs = dict(
+            taxel_convs=model_cfg.taxel_convs, taxel_channels=model_cfg.taxel_channels
+        )
+    elif model_cfg.taxel_convs:
+        raise ValueError("model.taxel_convs only applies to cnn_v0")
     return MODELS[model_cfg.name](
         taxel_shape=tuple(taxel_shape),
         base_channels=model_cfg.base_channels,

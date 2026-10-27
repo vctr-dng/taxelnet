@@ -42,6 +42,8 @@ BUNDLE = [
     "plots/epoch_0002/per_taxel_mae.png",
     "plots/epoch_0003/test_metrics.json",
     "plots/best/samples.png",
+    "plots/best/ssim_by_group.png",
+    "plots/best_val/ssim_by_group.png",
 ]
 
 
@@ -121,6 +123,7 @@ def test_run_training_two_epochs(tmp_path, synthetic_pair, grasp_pair):
         "plots/epoch_0002",
         "plots/epoch_0003",
         "plots/best",
+        "plots/best_val",
     }
     assert {a.path for a in client.list_artifacts(result.run_id, "checkpoints")} == {
         "checkpoints/epoch_0002.pt",
@@ -142,3 +145,15 @@ def test_run_training_two_epochs(tmp_path, synthetic_pair, grasp_pair):
     np.testing.assert_allclose(predict(model, ds, pre), expected, rtol=1e-5, atol=1e-3)
     loaded = load_model(result.run_dir / "model.pt")
     np.testing.assert_allclose(predict(loaded, ds, pre), expected, rtol=1e-5, atol=1e-3)
+
+    # test pads rescaled from their own readings: own y_scale and fitted gain
+    for key in ("padgain_k5_mae", "padgain_oracle_ssim", "testscale_k5_mae",
+                "testscale_all_mae", "testscale_all_factor_S1"):  # fmt: skip
+        assert math.isfinite(metrics["test"][key]), key
+
+    # warm start: weights and input scaler come from the first bundle
+    cfgs.train.init_from = result.run_dir
+    cfgs.train.epochs, cfgs.train.test_every = 1, 0
+    warm = run_training(cfgs)
+    warm_pre = Preprocessor.load(warm.run_dir / "preprocessing.json")
+    assert warm_pre.x_scale == pre.x_scale and warm_pre.x_center == pre.x_center

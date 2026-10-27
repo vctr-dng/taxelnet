@@ -25,6 +25,7 @@ from taxelnet import amp, artifacts
 from taxelnet.checkpoint import (
     ARTIFACT_CONTRACT_VERSION,
     load_checkpoint,
+    load_model,
     save_checkpoint,
     save_model,
 )
@@ -36,8 +37,11 @@ from taxelnet.dataset import (
     load_paired,
     load_test_paired,
 )
+from taxelnet.calibration import unseen_pad_metrics
 from taxelnet.evaluation import (
     compute_metrics,
+    global_ssim,
+    object_group,
     object_metrics,
     predict,
     predictions_frame,
@@ -45,7 +49,11 @@ from taxelnet.evaluation import (
 )
 from taxelnet.io_csv import file_sha256
 from taxelnet.model import build_model
-from taxelnet.plots import save_inference_plots, select_plot_samples
+from taxelnet.plots import (
+    plot_group_label,
+    save_inference_plots,
+    select_plot_samples,
+)
 from taxelnet.preprocessing import Preprocessor
 from taxelnet.ssi import ssi_losses
 from taxelnet.saturation import head_bounds
@@ -305,6 +313,16 @@ def run_training(cfgs: Configs) -> RunResult:
         paired.y[train_rows],
         None if paired.sensor is None else paired.sensor[train_rows],
     )
+    init_from = cfgs.train.init_from
+    if init_from is not None:
+        src_pre = Preprocessor.load(init_from / "preprocessing.json")
+        if src_pre.config.input_scaler != cfgs.preprocessing.input_scaler:
+            raise ValueError(
+                f"init_from input_scaler {src_pre.config.input_scaler!r} != "
+                f"{cfgs.preprocessing.input_scaler!r}"
+            )
+        pre.x_center, pre.x_scale = src_pre.x_center, src_pre.x_scale
+        print(f"init_from {init_from}: input scaler x_scale={pre.x_scale:.4f} reused")
     if cfgs.preprocessing.target_group_key != "none":
         if cfgs.train.loss_logamp_weight > 0:
             raise ValueError("loss_logamp_weight is not supported with target_group_key")
@@ -335,6 +353,9 @@ def run_training(cfgs: Configs) -> RunResult:
         if cfgs.model.head_upper is None:
             cfgs.model.head_upper = hi
     model = build_model(cfgs.model, paired.taxel_shape).to(device)
+    if init_from is not None:
+        # strict: the pre-trained architecture must match this run's model config
+        model.load_state_dict(load_model(init_from / "model.pt").state_dict())
     out = model(ds["train"].x[:1])
     if tuple(out.shape[1:]) != paired.taxel_shape:
         raise ValueError(
@@ -418,13 +439,49 @@ def run_training(cfgs: Configs) -> RunResult:
 
         test_target, test_group = test.y, test.group
         test_names = [test.groups[g]["path"] for g in test_group]
-        plot_pos = select_plot_samples(test_target, cfgs.eval.plot_samples)
-        plot_titles = [
-            "{path} @ {force:g} (row {row})".format(
-                **test.groups[test.group[r]], row=test.source_rows[r]
+
+        def reading_titles(src: PairedData, rows: np.ndarray) -> list[str]:
+            return [
+                "{path} @ {force:g} (row {row})".format(
+                    **src.groups[src.group[r]], row=src.source_rows[r]
+                )
+                for r in rows
+            ]
+
+        def group_labels(src: PairedData, rows: np.ndarray) -> np.ndarray:
+            return np.array(
+                [
+                    plot_group_label(src.groups[g]["path"], src.groups[g]["force"])
+                    for g in src.group[rows]
+                ]
             )
-            for r in plot_pos
-        ]
+
+        plot_pos = select_plot_samples(test_target, cfgs.eval.plot_samples)
+        plot_titles = reading_titles(test, plot_pos)
+        test_rows = np.arange(len(test_group))
+        test_all_titles = reading_titles(test, test_rows)
+        test_labels = group_labels(test, test_rows)
+        test_objects = np.array([object_group(s) for s in test_names])
+
+        # training-pad y_scale per test pad label (global_scale only: a pure division)
+        train_scale = None
+        if test.sensor is not None and cfgs.preprocessing.target_scaler == "global_scale":
+            if pre.group_labels:
+                train_scale = {
+                    g: float(s) for g, s in zip(pre.group_labels, pre.y_scale)
+                }
+            else:
+                train_scale = {q: float(pre.y_scale) for q in set(test.sensor)}
+
+        def pad_metrics(pred: np.ndarray) -> dict[str, float]:
+            """Test pads are not the training pads: rescaled per test pad from its own
+            readings, by its own y_scale (testscale_*) or a fitted gain (padgain_*)."""
+            if test.sensor is None:
+                return {}
+            return unseen_pad_metrics(
+                pred, test_target, test.sensor, test_objects, train_scale,
+                cfgs.eval.ssim_data_range,
+            )  # fmt: skip
 
         def evaluate_test(model: nn.Module, name: str, title: str) -> dict:
             """Test metrics of `model` + inference plots in plots/<name>/."""
@@ -433,10 +490,13 @@ def run_training(cfgs: Configs) -> RunResult:
                 pred, test_target, test_group, cfgs.eval.ssim_data_range
             )
             m |= object_metrics(pred, test_target, test_group, test_names)
+            m |= pad_metrics(pred)
             out = run_dir / "plots" / name
             save_inference_plots(
                 out, test.x, test_target, pred, m, plot_pos,
-                plot_titles, title,
+                plot_titles, title, group_labels=test_labels,
+                ssim=global_ssim(pred, test_target, cfgs.eval.ssim_data_range),
+                titles=test_all_titles, per_group=cfgs.eval.plot_samples_per_group,
             )  # fmt: skip
             artifacts.write_json(out / "test_metrics.json", m)
             mlflow.log_artifacts(str(out), f"plots/{name}")
@@ -494,6 +554,25 @@ def run_training(cfgs: Configs) -> RunResult:
             phys = model.report(run_dir)
             mlflow.log_metrics({f"final_phys_{k}": v for k, v in phys.items()})
         evaluate_test(model, "best", f"test, best model (epoch {history.best_epoch})")
+        # same per-group plots for the validation partition, best model only
+        vsrc, vrows = sources["val"]
+        if len(vrows):
+            vpred, vtarget = predict(model, ds["val"], pre), vsrc.y[vrows]
+            vm = compute_metrics(
+                vpred, vtarget, vsrc.group[vrows], cfgs.eval.ssim_data_range
+            )
+            vtitles = reading_titles(vsrc, vrows)
+            vpos = select_plot_samples(vtarget, cfgs.eval.plot_samples)
+            out = run_dir / "plots" / "best_val"
+            save_inference_plots(
+                out, vsrc.x[vrows], vtarget, vpred, vm, vpos,
+                [vtitles[p] for p in vpos],
+                f"val, best model (epoch {history.best_epoch})",
+                group_labels=group_labels(vsrc, vrows),
+                ssim=global_ssim(vpred, vtarget, cfgs.eval.ssim_data_range),
+                titles=vtitles, per_group=cfgs.eval.plot_samples_per_group,
+            )  # fmt: skip
+            mlflow.log_artifacts(str(out), "plots/best_val")
 
         metrics: dict = {
             "best_epoch": history.best_epoch,
@@ -510,7 +589,7 @@ def run_training(cfgs: Configs) -> RunResult:
             if p == TEST:
                 obj = object_metrics(pred, target, group, test_names)
                 metrics[p]["reference"]["trivial_zero"] |= obj.pop("reference")
-                metrics[p] |= obj
+                metrics[p] |= obj | pad_metrics(pred)
                 if len(pred) != len(test.group):
                     raise AssertionError("test predictions do not cover the test file")
                 predictions_frame(src, rows, p, pred).write_parquet(

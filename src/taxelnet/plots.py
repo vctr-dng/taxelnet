@@ -7,6 +7,7 @@ axis is X (41.80 mm at the top, like tax1 / n195), the horizontal axis is Y.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import numpy as np
@@ -25,6 +26,68 @@ def select_plot_samples(target: np.ndarray, n: int) -> np.ndarray:
     order = np.argsort(np.abs(target).reshape(len(target), -1).max(1), kind="stable")
     picks = np.linspace(0, len(order) - 1, min(n, len(order))).round().astype(np.int64)
     return order[picks]
+
+
+def plot_group_label(name: str, force: float) -> str:
+    """Plot group of a reading: object, force, pad if any.
+
+    The object is the Path part before "/" (training files) or the first two Name
+    tokens (grasp test file): `Cylinder_TestButtons_235_..._S2` @ 235 ->
+    `Cylinder_TestButtons_235_S2`; `Cuboid_G/20_02_A_..._S1` @ 20 -> `Cuboid_G_20_S1`;
+    `TriangleM/Lateral2` @ 40 -> `TriangleM_40`.
+    """
+    tokens = re.split(r"[_/]", name)
+    obj = name.split("/")[0] if "/" in name else "_".join(tokens[:2])
+    label = f"{obj}_{force:g}"
+    if tokens[-1] in ("S1", "S2"):
+        label += f"_{tokens[-1]}"
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", label)
+
+
+def select_group_samples(
+    target: np.ndarray, labels: np.ndarray, n: int
+) -> dict[str, np.ndarray]:
+    """{label: positions of `n` readings of that group, weak to strong peak signal}."""
+    out = {}
+    for label in sorted(set(labels.tolist())):
+        pos = np.flatnonzero(labels == label)
+        out[label] = pos[select_plot_samples(target[pos], n)]
+    return out
+
+
+def plot_ssim_by_group(ssim: np.ndarray, labels: np.ndarray) -> Figure:
+    """Per-reading SSIM of every group: box (quartiles, 1.5 IQR whiskers) + points."""
+    groups = sorted(set(labels.tolist()))
+    fig = Figure(figsize=(7, 1.2 + 0.55 * len(groups)), layout="constrained")
+    ax = fig.subplots()
+    data = [ssim[labels == g] for g in groups]
+    ax.boxplot(
+        data,
+        orientation="horizontal",
+        widths=0.5,
+        showfliers=False,
+        medianprops={"color": "#1f3a5f", "lw": 2},
+        boxprops={"color": "#6b7280"},
+        whiskerprops={"color": "#6b7280"},
+        capprops={"color": "#6b7280"},
+    )
+    rng = np.random.default_rng(0)
+    for i, d in enumerate(data, start=1):
+        jitter = rng.uniform(-0.15, 0.15, len(d))
+        ax.scatter(d, i + jitter, s=8, color="#3b82c4", alpha=0.45, lw=0)
+        ax.text(
+            1.02, i, f"median {np.median(d):.2f}  (n={len(d)})",
+            va="center", fontsize=8, color="#374151",
+            transform=ax.get_yaxis_transform(),
+        )  # fmt: skip
+    ax.set_yticks(range(1, len(groups) + 1), groups, fontsize=8)
+    ax.invert_yaxis()
+    ax.set_xlabel("SSIM (one window per map)")
+    ax.grid(axis="x", color="#e5e7eb", lw=0.8)
+    ax.set_axisbelow(True)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    return fig
 
 
 def _annotate(ax, im, grid: np.ndarray, fmt: str = "{:.0f}") -> None:
@@ -75,7 +138,7 @@ def plot_samples(
         _annotate(ax_r, im, residual)
         fig.colorbar(im, ax=ax_r, label="TC")
         ax_r.set_title(f"residual (MAE {np.abs(residual).mean():.1f})")
-        ax_in.set_title(titles[i], fontsize=9)
+        ax_in.set_title(titles[i].replace(" @ ", "\n@ "), fontsize=8)
         ax_in.set_ylabel("X (mm)")
         for ax in axes[i]:
             ax.set_xlabel("Y (mm)")
@@ -126,11 +189,31 @@ def save_inference_plots(
     sample_pos: np.ndarray,
     sample_titles: list[str],
     title: str,
+    group_labels: np.ndarray | None = None,
+    ssim: np.ndarray | None = None,
+    titles: list[str] | None = None,
+    per_group: int = 3,
+    max_groups: int = 40,
 ) -> list[Path]:
     """Write samples.png, scatter.png and per_taxel_mae.png; `x_mm`, `target`, `pred`
-    cover the whole evaluated partition, `sample_pos` indexes into them."""
+    cover the whole evaluated partition, `sample_pos` indexes into them.
+
+    With `group_labels` (one per reading): also samples/<group>.png (`per_group`
+    readings of each group, titled from `titles`, one per reading) and, with the
+    per-reading `ssim`, ssim_by_group.png. Skipped when there are more than
+    `max_groups` groups (e.g. indenter shape x force)."""
     out_dir.mkdir(parents=True, exist_ok=True)
-    figures = {
+    figures: dict[str, Figure] = {}
+    if group_labels is not None and len(set(group_labels)) <= max_groups:
+        labels = np.asarray(group_labels).astype(str)
+        for label, pos in select_group_samples(target, labels, per_group).items():
+            figures[f"samples/{label}.png"] = plot_samples(
+                x_mm[pos], target[pos], pred[pos],
+                [titles[p] if titles else label for p in pos],
+            )  # fmt: skip
+        if ssim is not None:
+            figures["ssim_by_group.png"] = plot_ssim_by_group(np.asarray(ssim), labels)
+    figures |= {
         "samples.png": plot_samples(
             x_mm[sample_pos], target[sample_pos], pred[sample_pos], sample_titles
         ),
@@ -143,6 +226,7 @@ def save_inference_plots(
     for name, fig in figures.items():
         fig.suptitle(title)
         path = out_dir / name
+        path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(path, dpi=110)
         paths.append(path)
     return paths

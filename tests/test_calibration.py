@@ -4,6 +4,7 @@ from taxelnet.calibration import (
     fit_calibration,
     run_protocol,
     shots_to_oracle,
+    unseen_pad_metrics,
     weighted_median,
 )
 
@@ -71,3 +72,25 @@ def test_taxel_affine_head_is_identity_at_init():
     assert sum(p.numel() for p in head.parameters()) - sum(
         p.numel() for p in base.parameters()
     ) == 56
+
+
+def test_unseen_pad_metrics_recover_per_pad_gain():
+    rng = np.random.default_rng(0)
+    pred = rng.uniform(0, 100, size=(60, 7, 4))
+    pads = np.array(["S1"] * 40 + ["S2"] * 20)
+    objects = np.array(["a"] * 20 + ["b"] * 20 + ["c"] * 20)
+    gain = np.where(pads == "S1", 2.0, 0.25)
+    target = pred * gain[:, None, None]
+    # training-pad scale = std of what the network predicts for that pad
+    train_scale = {q: float(pred[pads == q].std()) for q in ("S1", "S2")}
+    m = unseen_pad_metrics(
+        pred, target, pads, objects, train_scale, 3600.0, ks=(3,), n_draws=5
+    )
+    assert m["padgain_k3_mae"] < 1e-9 and m["padgain_oracle_obj_mean_mae"] < 1e-9
+    # the test pad's own std recovers the gain exactly when computed on all readings
+    assert abs(m["testscale_all_factor_S1"] - 2.0) < 1e-9
+    assert abs(m["testscale_all_factor_S2"] - 0.25) < 1e-9
+    assert m["testscale_all_mae"] < 1e-9 and m["testscale_k3_mae"] > 0
+    assert m["padgain_oracle_ssim"] > 0.999
+    no_scale = unseen_pad_metrics(pred, target, pads, objects, None, 3600.0, ks=(3,))
+    assert not any(k.startswith("testscale") for k in no_scale)
