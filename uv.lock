@@ -236,6 +236,15 @@ wheels = [
 ]
 
 [[package]]
+name = "bottle"
+version = "0.13.4"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/7a/71/cca6167c06d00c81375fd668719df245864076d284f7cb46a694cbeb5454/bottle-0.13.4.tar.gz", hash = "sha256:787e78327e12b227938de02248333d788cfe45987edca735f8f88e03472c3f47", size = 98717, upload-time = "2025-06-15T10:08:59.439Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/83/f6/b55ec74cfe68c6584163faa311503c20b0da4c09883a41e8e00d6726c954/bottle-0.13.4-py2.py3-none-any.whl", hash = "sha256:045684fbd2764eac9cdeb824861d1551d113e8b683d8d26e296898d3dd99a12e", size = 103807, upload-time = "2025-06-15T10:08:57.691Z" },
+]
+
+[[package]]
 name = "cachetools"
 version = "7.2.6"
 source = { registry = "https://pypi.org/simple" }
@@ -2145,6 +2154,19 @@ wheels = [
 ]
 
 [[package]]
+name = "optuna-dashboard"
+version = "0.21.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "bottle" },
+    { name = "optuna" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f4/4b/da8f6575c0e305777dc737e3587a494aa948705c02d95bd99cd4455ee7fc/optuna_dashboard-0.21.0.tar.gz", hash = "sha256:d7446461602a32b40bff12b7c936bb50f074b54b6099bbe855d5b6ea26f33a4c", size = 3901519, upload-time = "2026-09-10T04:45:39.368Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/20/a3/8c9ed4db82bfa9d68806d746e428a57da5ee00fdd4489b896823bb870fc1/optuna_dashboard-0.21.0-py3-none-any.whl", hash = "sha256:1915952f2083387a187633893d812b4d81b3ab8d913eeb29b3acc5869e642e1e", size = 3918047, upload-time = "2026-09-10T04:45:37.591Z" },
+]
+
+[[package]]
 name = "packaging"
 version = "26.3"
 source = { registry = "https://pypi.org/simple" }
@@ -3137,6 +3159,7 @@ dependencies = [
     { name = "mlflow" },
     { name = "numpy" },
     { name = "optuna" },
+    { name = "optuna-dashboard" },
     { name = "polars" },
     { name = "torch" },
     { name = "torchvision" },
@@ -3156,6 +3179,7 @@ requires-dist = [
     { name = "mlflow", specifier = ">=3.16.1" },
     { name = "numpy", specifier = ">=2.5.3" },
     { name = "optuna", specifier = ">=5.0.0" },
+    { name = "optuna-dashboard", specifier = ">=0.21.0" },
     { name = "polars", specifier = ">=1.44.2" },
     { name = "torch", specifier = ">=2.14.1" },
     { name = "torchvision", specifier = ">=0.29.1" },
